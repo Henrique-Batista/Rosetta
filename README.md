@@ -2,6 +2,9 @@
 
 # Rosetta — OpenAI-to-ACP Proxy
 
+![Rosetta](assets/Rosetta%201%20(English).excalidraw.png)
+![Rosetta](assets/Rosetta%202%20(English).excalidraw.png)
+
 Rosetta is an HTTP proxy written in Rust that translates between OpenAI's **Responses API** / **Chat Completions API** and the **Agent Client Protocol (ACP)**. It spawns an ACP-compatible agent (e.g. `opencode acp`) via stdio JSON-RPC 2.0 and exposes OpenAI-compatible HTTP endpoints.
 
 ## Table of Contents
@@ -16,7 +19,7 @@ Rosetta is an HTTP proxy written in Rust that translates between OpenAI's **Resp
 - [Response Format](#response-format)
 - [Debugging](#debugging)
 - [ACP Compatibility](#acp-compatibility)
-- [Important Notes](#important-notes)
+- [Important Notes](#important-notes)(
 - [Roadmap](#roadmap)
 - [Development](#development)
 
