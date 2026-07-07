@@ -1,0 +1,52 @@
+[workspace]
+members = [
+    "crates/rosetta-types",
+    "crates/rosetta-acp",
+    "crates/rosetta-core",
+    "crates/rosetta-server",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Pablitux"]
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.48", features = ["full"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# HTTP server
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# SSE / Streaming
+async-stream = "0.3"
+futures = "0.3"
+tokio-stream = "0.1"
+
+# Errors
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utilities
+uuid = { version = "1.18", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# CLI parsing
+clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
+
+# Internal crates
+rosetta-types = { path = "crates/rosetta-types" }
+rosetta-acp = { path = "crates/rosetta-acp" }
+rosetta-core = { path = "crates/rosetta-core" }
