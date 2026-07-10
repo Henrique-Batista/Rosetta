@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "rosetta_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "rosetta"
 path = "src/main.rs"
@@ -27,3 +31,6 @@ futures = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["stream", "json"] }

@@ -10,9 +10,27 @@ Emits a realistic sequence of updates:
 6. Final prompt response
 
 Temporal delays simulate real agent streaming behavior.
+
+Env vars (all optional, default behavior unchanged when unset):
+- MOCK_ACP_CHUNK_DELAY_MS: sleep this many ms between each emitted chunk
+  notification (default 0 = no delay, current fixed-delay behavior kept).
+  Non-numeric values fall back to 0 rather than crashing.
+- MOCK_ACP_CRASH_AFTER_CHUNKS=N: after emitting N chunk notifications for a
+  given session/prompt request, close stdout / exit without sending the
+  final PromptResponse line, simulating an agent crash mid-turn.
+- MOCK_ACP_ECHO=1: include a distinguishing substring from the incoming
+  prompt text in the emitted agent_message_chunk content, so concurrent
+  requests can be told apart by their content.
+- MOCK_ACP_TOOL_NAME: override the `name` field of the emitted tool_call
+  chunk (default "get_weather"). Allows integration tests to advertise
+  arbitrary tools.
+- MOCK_ACP_TOOL_ARGS: override the `arguments` field of the emitted
+  tool_call chunk (default '{"city": "Paris"}'). Must be a JSON-encoded
+  string if set, exactly as it should appear on the wire.
 """
 
 import json
+import os
 import sys
 import time
 
@@ -22,7 +40,47 @@ def send_line(obj: dict):
     sys.stdout.flush()
 
 
+def _chunk_delay_ms() -> float:
+    raw = os.environ.get("MOCK_ACP_CHUNK_DELAY_MS", "0")
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 0.0
+
+
+def _crash_after_chunks():
+    raw = os.environ.get("MOCK_ACP_CRASH_AFTER_CHUNKS")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _echo_marker(params: dict) -> str:
+    """Extract a short distinguishing substring from the incoming prompt."""
+    prompt = params.get("prompt", [])
+    for block in prompt:
+        text = block.get("text")
+        if text:
+            return text.strip()[:40]
+    return ""
+
+
+def _tool_name() -> str:
+    return os.environ.get("MOCK_ACP_TOOL_NAME", "get_weather")
+
+
+def _tool_args() -> str:
+    return os.environ.get("MOCK_ACP_TOOL_ARGS", '{"city": "Paris"}')
+
+
 def main():
+    delay_s = _chunk_delay_ms() / 1000.0
+    crash_after = _crash_after_chunks()
+    echo_enabled = os.environ.get("MOCK_ACP_ECHO") == "1"
+
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -62,92 +120,80 @@ def main():
 
         elif method == "session/prompt":
             session_id = params.get("sessionId", "")
+            marker = _echo_marker(params) if echo_enabled else ""
+            marker_suffix = f" [{marker}]" if marker else ""
 
-            # 1. Thinking / reasoning
-            send_line(
+            tool_args = _tool_args()
+
+            chunk_notifications = [
                 {
-                    "jsonrpc": "2.0",
-                    "method": "session/update",
-                    "params": {
-                        "sessionId": session_id,
-                        "updateType": "agent_thought_chunk",
-                        "data": {
-                            "content": {
-                                "type": "text",
-                                "text": "I should check the weather first.",
-                            }
-                        },
+                    "updateType": "agent_thought_chunk",
+                    "data": {
+                        "content": {
+                            "type": "text",
+                            "text": f"I should check the weather first.{marker_suffix}",
+                        }
                     },
-                }
-            )
-            time.sleep(0.05)
-
-            # 2. Tool call (agent decides to check weather)
-            send_line(
+                },
                 {
-                    "jsonrpc": "2.0",
-                    "method": "session/update",
-                    "params": {
-                        "sessionId": session_id,
-                        "updateType": "tool_call",
-                        "data": {
-                            "toolCallId": "call_1",
-                            "title": "Get weather",
-                            "name": "get_weather",
-                            "arguments": '{"city": "Paris"}',
-                        },
+                    "updateType": "tool_call",
+                    "data": {
+                        "toolCallId": "call_1",
+                        "title": "Get weather",
+                        "name": _tool_name(),
+                        "arguments": tool_args[: max(1, len(tool_args) // 2)],
                     },
-                }
-            )
-            time.sleep(0.05)
-
-            # 3. More thinking after tool call
-            send_line(
+                },
                 {
-                    "jsonrpc": "2.0",
-                    "method": "session/update",
-                    "params": {
-                        "sessionId": session_id,
-                        "updateType": "agent_thought_chunk",
-                        "data": {
-                            "content": {
-                                "type": "text",
-                                "text": "Now I can answer with the weather data.",
-                            }
-                        },
+                    "updateType": "tool_call_update",
+                    "data": {
+                        "toolCallId": "call_1",
+                        "title": "Get weather",
+                        "name": _tool_name(),
+                        "arguments": tool_args,
                     },
-                }
-            )
-            time.sleep(0.05)
-
-            # 4. Output text — first chunk
-            send_line(
+                },
                 {
-                    "jsonrpc": "2.0",
-                    "method": "session/update",
-                    "params": {
-                        "sessionId": session_id,
-                        "updateType": "agent_message_chunk",
-                        "data": {"content": "Hello "},
+                    "updateType": "agent_thought_chunk",
+                    "data": {
+                        "content": {
+                            "type": "text",
+                            "text": "Now I can answer with the weather data.",
+                        }
                     },
-                }
-            )
-            time.sleep(0.05)
-
-            # 5. Output text — second chunk
-            send_line(
+                },
                 {
-                    "jsonrpc": "2.0",
-                    "method": "session/update",
-                    "params": {
-                        "sessionId": session_id,
-                        "updateType": "agent_message_chunk",
-                        "data": {"content": "world! The weather in Paris is sunny."},
-                    },
-                }
-            )
+                    "updateType": "agent_message_chunk",
+                    "data": {"content": f"Hello{marker_suffix} "},
+                },
+                {
+                    "updateType": "agent_message_chunk",
+                    "data": {"content": "world! The weather in Paris is sunny."},
+                },
+            ]
 
-            # 6. Final prompt response
+
+            chunks_sent = 0
+            for i, notification in enumerate(chunk_notifications):
+                send_line(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": {"sessionId": session_id, **notification},
+                    }
+                )
+                chunks_sent += 1
+
+                if crash_after is not None and chunks_sent >= crash_after:
+                    # Simulate an agent crash mid-turn: close stdout without
+                    # ever sending the final PromptResponse line.
+                    sys.stdout.close()
+                    return
+
+                if i < len(chunk_notifications) - 1 and delay_s > 0:
+                    time.sleep(delay_s)
+
+            # Final prompt response
             send_line(
                 {
                     "jsonrpc": "2.0",

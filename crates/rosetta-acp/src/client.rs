@@ -11,6 +11,14 @@ use rosetta_types::acp::{
 
 use crate::{AcpError, AcpTransport};
 
+/// One item yielded by [`AcpClient::send_prompt_streaming`].
+#[derive(Debug, Clone)]
+pub enum AcpStreamItem {
+    Update(SessionUpdate),
+    Completed,
+    Disconnected,
+}
+
 /// High-level ACP client that wraps [`AcpTransport`] and speaks JSON-RPC 2.0.
 pub struct AcpClient {
     transport: AcpTransport,
@@ -88,11 +96,18 @@ impl AcpClient {
     /// Send the `session/prompt` request and return a stream of `session/update`
     /// notifications. The stream ends when the matching prompt response arrives.
     /// The caller must drop the stream before calling other &mut self methods.
+    ///
+    /// Each yielded [`AcpStreamItem`] distinguishes normal completion
+    /// (`Completed`, once the matching `PromptResponse` arrives) from an
+    /// abnormal disconnect (`Disconnected`, transport closed/errored without
+    /// a matching response) — callers that need to tell these apart (e.g. to
+    /// emit an identifiable error signal) can match on the variant instead of
+    /// having both paths look like a plain stream end.
     pub fn send_prompt_streaming<'a>(
         &'a mut self,
         session_id: &'a str,
         prompt: Vec<ContentBlock>,
-    ) -> impl Stream<Item = SessionUpdate> + 'a {
+    ) -> impl Stream<Item = AcpStreamItem> + 'a {
         let id = self.next_id();
         let req = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
@@ -107,23 +122,34 @@ impl AcpClient {
             let msg = serde_json::to_string(&req).unwrap_or_default();
             if let Err(e) = self.transport.send_message(&msg).await {
                 error!(error = %e, "Failed to send prompt in streaming");
+                yield AcpStreamItem::Disconnected;
                 return;
             }
             loop {
                 match self.transport.read_line().await {
-                    Ok(None) => return,
+                    Ok(None) => {
+                        yield AcpStreamItem::Disconnected;
+                        return;
+                    }
                     Ok(Some(line)) => {
                         if let Some(update) = self.try_parse_notification::<SessionUpdate>(&line) {
                             if update.session_id == session_id {
-                                yield update;
+                                yield AcpStreamItem::Update(update);
                             }
                             continue;
                         }
-                        // Prompt response arrived — stream is done
+                        // Prompt response arrived — stream is done normally.
+                        // The response's `usage` field is intentionally not
+                        // parsed/propagated here (out of scope, stays
+                        // hard-coded per the project roadmap).
                         let _ = self.try_parse_response::<PromptResponse>(&line, id);
+                        yield AcpStreamItem::Completed;
                         return;
                     }
-                    Err(_) => return,
+                    Err(_) => {
+                        yield AcpStreamItem::Disconnected;
+                        return;
+                    }
                 }
             }
         }

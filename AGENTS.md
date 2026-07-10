@@ -164,13 +164,17 @@ ROSETTA_ACP_ARGS="crates/rosetta-acp/tests/fixtures/mock_acp.py" \
 
 ## Response Structure
 
-Rosetta translates ACP agent updates into OpenAI-compatible response structures:
+Rosetta translates ACP agent updates into OpenAI-compatible response structures.
+Tool calls are **dual-routed**: client-defined tools (passed in `req.tools`) become
+`FunctionCall` output items, while agent-internal tools (skills, MCP) are surfaced as
+`reasoning` items or silently consumed.
 
 | ACP Update Type | OpenAI Output | Description |
 |----------------|---------------|-------------|
 | `agent_thought_chunk` | `OutputItem::Reasoning` (type: `reasoning`, summary_type: `thinking`) | Model's internal reasoning/thinking |
 | `agent_message_chunk` | `OutputItem::Message` (type: `message`) | Final user-facing output text |
-| `tool_call` | `OutputItem::Reasoning` (type: `reasoning`, summary_type: `tool_call`) | Agent's tool invocation (exposed as reasoning, not function call) |
+| `tool_call` | `OutputItem::FunctionCall` (type: `function_call`) | **Consumer tool**: name matches a client-defined tool in `req.tools` → forwarded as a proper function call |
+| `tool_call` | *(silently consumed)* | **Agent-internal tool**: name does NOT match any client-defined tool → dropped for Chat Completions, shown as `reasoning` for Responses API |
 | `available_commands_update` | *(silently dropped — logged at debug level)* | Agent announcing available commands/skills |
 | other types | *(silently dropped — logged at debug level)* | Unhandled update types |
 
@@ -243,7 +247,7 @@ Rosetta is built on top of the **Agent Client Protocol (ACP)**, which is defined
 
 | Feature | Impact | Details |
 |---------|--------|---------|
-| **Tool execution loop** | 🔴 opencode-specific | When the agent makes a `tool_call`, Rosetta converts it to a `Reasoning` output item. There is no loop to execute the tool and send results back to the agent. This means tool-dependent workflows (e.g., web search, file operations) won't complete. |
+| **Tool execution loop** | 🔴 opencode-specific | When the agent makes a `tool_call`, Rosetta converts it to a `FunctionCall` output item. There is no loop to execute the tool and send results back to the agent. This means tool-dependent workflows (e.g., web search, file operations) won't complete. |
 | **Multi-modal content** | 🟡 ACP-compliant | `InputImage` and `InputFile` are dropped. Only `InputText` is forwarded. An agent expecting images or files will not receive them. |
 | **Token usage reporting** | 🟡 ACP-compliant | Currently hard-coded to zero. The ACP agent's `PromptResponse.usage` is available but not yet parsed. |
 
@@ -260,10 +264,10 @@ Rosetta is built on top of the **Agent Client Protocol (ACP)**, which is defined
 ## Important Notes
 
 - **Runtime parameters** (`temperature`, `top_p`, etc.) are ignored per ACP spec — they are not forwarded to the agent.
-- **Streaming**: Rosetta supports two streaming paths:
-  - Responses API: uses `response_to_streaming_events()` to generate proper SSE events from the accumulated response
-  - Chat Completions: uses `response_to_chat_chunks()` to split text into word-by-word delta chunks with proper `role`/`finish_reason`/`usage` framing
-  - A true streaming method (`send_prompt_streaming()`) is available in `AcpClient` via `async_stream` for real-time ACP update processing
+- **Rosetta Harness Prompt**: When the client provides tools (`req.tools`), Rosetta injects a short `[Rosetta Harness]` system prefix into the ACP prompt telling the agent which tools are client-executed. The agent emits `tool_call` for client tools; Rosetta forwards them as `FunctionCall`/`tool_calls`. When no tools are provided, no harness is injected and all tool calls are agent-internal (backward compatible). See `translate.rs::format_rosetta_harness_prompt()`.
+- **Streaming**: for `stream: true` requests, both APIs now deliver content live, as the ACP agent produces it, instead of collecting the whole turn first:
+  - Responses API and Chat Completions both consume `AcpClient::send_prompt_streaming()` through a task-owned bounded channel (`rosetta-server/src/streaming_task.rs`), translating each `session/update` into an SSE event/chunk as it arrives
+  - Non-streaming (`stream: false`) requests are unaffected and still use `response_to_streaming_events()`/`response_to_chat_chunks()`'s batch-mode siblings, `response_to_chat_completion()`
 - **MCP servers** are passed through the ACP-standard `mcpServers` field in `session/new` — configure via `ROSETTA_MCP_SERVERS` env var
 - The `InputItem` enum requires `"type": "message"` in the input array.
 - ACP field names use `camelCase` (e.g. `protocolVersion`, `sessionId`).
@@ -277,9 +281,10 @@ Rosetta is built on top of the **Agent Client Protocol (ACP)**, which is defined
 |------|-------------|--------|
 | **Skill trigger evaluation in ACP mode** | Skills from `~/.opencode/skills/` are loaded and announced via `available_commands_update`, but the ACP agent does not evaluate SKILL.md trigger conditions automatically. In CLI mode, opencode checks triggers before building the LLM prompt. In ACP mode, the trigger logic is not executed. This needs to be implemented in the ACP agent (opencode), not in Rosetta. | 🔜 Future (opencode-side) |
 | **Input file/image support** | `InputFile` and `InputImage` content parts in the OpenAI request are dropped during prompt translation. Only `InputText` parts are forwarded to the ACP agent. | 📋 Planned |
-| **True streaming for Responses API** | The current SSE path collects all updates first, then generates events from the finalized response. A true streaming path using `send_prompt_streaming()` exists in `AcpClient` but is not yet wired into the HTTP route handler (requires channel-based architecture). | 📋 Planned |
+| **True streaming for the Responses API and Chat Completions API** | `send_prompt_streaming()` is now wired into both HTTP route handlers via a task-owned bounded channel; `stream: true` requests deliver content incrementally as the agent produces it. | ✅ Done |
 | **Token usage tracking** | Current usage is hard-coded to `{input_tokens: 0, output_tokens: 0, total_tokens: 0}`. The ACP agent's `PromptResponse.usage` is available but not yet parsed. | 📋 Planned |
-| **Tool call execution loop** | When the agent makes a `tool_call`, Rosetta converts it to a `Reasoning` output item. There is no loop to execute the tool and send results back to the agent. | 🔜 Future |
+| **Consumer tool calling** | `tool_call` ACP updates are translated to `OutputItem::FunctionCall` in the Responses API and `tool_calls` delta/chunks in the Chat Completions API. Tool definitions from the request are injected into the ACP system prompt. | ✅ Done |
+| **Tool call execution loop** | When the agent makes a `tool_call`, Rosetta converts it to a `FunctionCall` output item. There is no loop to execute the tool and send results back to the agent. | 🔜 Future |
 
 ## Development
 

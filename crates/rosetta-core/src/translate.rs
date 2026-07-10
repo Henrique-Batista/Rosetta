@@ -46,10 +46,13 @@ pub fn chat_messages_to_acp_prompt(messages: &[ChatMessage]) -> Vec<ContentBlock
         .iter()
         .map(|msg| {
             let prefix = match msg.role.as_str() {
-                "system" | "developer" => "[System]\n",
-                "assistant" => "[Assistant]\n",
-                "tool" => "[Tool Result]\n",
-                _ => "",
+                "system" | "developer" => "[System]\n".to_string(),
+                "assistant" => "[Assistant]\n".to_string(),
+                "tool" => match &msg.tool_call_id {
+                    Some(call_id) => format!("[Tool Result: {}]\n", call_id),
+                    None => "[Tool Result]\n".to_string(),
+                },
+                _ => String::new(),
             };
             let text = msg.content.clone().unwrap_or_default();
             ContentBlock::Text {
@@ -57,6 +60,147 @@ pub fn chat_messages_to_acp_prompt(messages: &[ChatMessage]) -> Vec<ContentBlock
             }
         })
         .collect()
+}
+
+/// Format Responses-API tool definitions as a `[Tool Definitions]` text block.
+///
+/// Returns an empty string when `tools` is empty so callers can prepend
+/// unconditionally without a separate length check.
+pub fn format_response_tool_definitions(tools: &[ToolDefinition]) -> String {
+    if tools.is_empty() {
+        return String::new();
+    }
+    let values: Vec<serde_json::Value> = tools.iter().map(tool_definition_to_value).collect();
+    match serde_json::to_string(&values) {
+        Ok(json) => format!("[Tool Definitions]\n{}", json),
+        Err(_) => String::new(),
+    }
+}
+
+/// Format Chat-Completions-API tool definitions as a `[Tool Definitions]` text block.
+///
+/// Returns an empty string when `tools` is empty so callers can prepend
+/// unconditionally without a separate length check.
+pub fn format_chat_tool_definitions(tools: &[ChatToolDefinition]) -> String {
+    if tools.is_empty() {
+        return String::new();
+    }
+    let values: Vec<serde_json::Value> = tools.iter().map(chat_tool_definition_to_value).collect();
+    match serde_json::to_string(&values) {
+        Ok(json) => format!("[Tool Definitions]\n{}", json),
+        Err(_) => String::new(),
+    }
+}
+
+/// Convert a Responses-API `ToolDefinition` into a `serde_json::Value` shaped
+/// like the OpenAI wire format (`type` / `name` / `description` / `parameters` / `strict`).
+fn tool_definition_to_value(t: &ToolDefinition) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("type".to_string(), serde_json::Value::String(t.tool_type.clone()));
+    obj.insert("name".to_string(), serde_json::Value::String(t.name.clone()));
+    if let Some(desc) = &t.description {
+        obj.insert("description".to_string(), serde_json::Value::String(desc.clone()));
+    }
+    if let Some(params) = &t.parameters {
+        obj.insert("parameters".to_string(), params.clone());
+    }
+    if let Some(strict) = t.strict {
+        obj.insert("strict".to_string(), serde_json::Value::Bool(strict));
+    }
+    serde_json::Value::Object(obj)
+}
+
+/// Convert a Chat-Completions-API `ChatToolDefinition` into a `serde_json::Value`
+/// shaped like the OpenAI wire format (nested `function` object).
+fn chat_tool_definition_to_value(t: &ChatToolDefinition) -> serde_json::Value {
+    let mut func = serde_json::Map::new();
+    func.insert("name".to_string(), serde_json::Value::String(t.function.name.clone()));
+    if let Some(desc) = &t.function.description {
+        func.insert("description".to_string(), serde_json::Value::String(desc.clone()));
+    }
+    if let Some(params) = &t.function.parameters {
+        func.insert("parameters".to_string(), params.clone());
+    }
+    if let Some(strict) = t.function.strict {
+        func.insert("strict".to_string(), serde_json::Value::Bool(strict));
+    }
+
+    let mut obj = serde_json::Map::new();
+    obj.insert("type".to_string(), serde_json::Value::String(t.tool_type.clone()));
+    obj.insert("function".to_string(), serde_json::Value::Object(func));
+    serde_json::Value::Object(obj)
+}
+
+/// Format a minimal Rosetta harness prompt that tells the ACP agent which
+/// tools are client-executed (consumer tools) and should be announced via
+/// `tool_call` rather than executed internally.
+///
+/// Returns an empty string when `names` is empty (backward compatible: no
+/// harness → all tool calls are agent-internal).
+pub fn format_rosetta_harness_prompt(names: &[String]) -> String {
+    if names.is_empty() {
+        return String::new();
+    }
+    format!(
+        "[Rosetta Harness]\n\
+         You are proxied through Rosetta. The following tools are executed by the client:\n\
+         {}\n\
+         To call one, emit a tool_call with its name and arguments.\n\
+         All other tools (skills, MCP) work as usual.",
+        names.join(", ")
+    )
+}
+
+/// Extract tool call arguments from a tool_call data object.
+///
+/// Tries named fields (`arguments`, `params`, `input`, `args`) first.
+/// Falls back to constructing an object from all non-metadata top-level
+/// fields, handling opencode ACP format where parameters are spread
+/// across fields like `locations`, `rawInput`, etc.
+pub fn extract_tool_call_arguments(data: &serde_json::Value) -> String {
+    // Prefer known argument field names
+    if let Some(args) = data
+        .get("arguments")
+        .or_else(|| data.get("params"))
+        .or_else(|| data.get("input"))
+        .or_else(|| data.get("args"))
+    {
+        return args
+            .as_str()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| args.to_string());
+    }
+
+    // Fallback: collect all top-level fields except metadata keys;
+    // also drop empty arrays, empty objects, and nulls so the output
+    // is cleaner for clients expecting OpenAI-style arguments.
+    const META_KEYS: &[&str] = &[
+        "toolCallId",
+        "tool_call_id",
+        "sessionUpdate",
+        "title",
+        "kind",
+        "name",
+        "status",
+    ];
+    if let Some(obj) = data.as_object() {
+        let mut filtered = serde_json::Map::new();
+        for (k, v) in obj {
+            if META_KEYS.contains(&k.as_str()) {
+                continue;
+            }
+            // Skip empty arrays/objects and null values.
+            if v.is_array() && v.as_array().unwrap().is_empty() { continue; }
+            if v.is_object() && v.as_object().unwrap().is_empty() { continue; }
+            if v.is_null() { continue; }
+            filtered.insert(k.clone(), v.clone());
+        }
+        if !filtered.is_empty() {
+            return serde_json::Value::Object(filtered).to_string();
+        }
+    }
+
+    "{}".to_string()
 }
 
 pub struct ResponseAccumulator {
@@ -68,6 +212,7 @@ pub struct ResponseAccumulator {
     pub text_buffer: String,
     pub thought_buffer: String,
     pub sequence_number: u32,
+    pub consumer_tool_names: Vec<String>,
 }
 
 pub struct MessageAccumulator {
@@ -76,7 +221,7 @@ pub struct MessageAccumulator {
 }
 
 impl ResponseAccumulator {
-    pub fn new(response_id: String, model: String) -> Self {
+    pub fn new(response_id: String, model: String, consumer_tool_names: Vec<String>) -> Self {
         Self {
             response_id,
             model,
@@ -86,6 +231,7 @@ impl ResponseAccumulator {
             text_buffer: String::new(),
             thought_buffer: String::new(),
             sequence_number: 0,
+            consumer_tool_names,
         }
     }
 
@@ -238,31 +384,137 @@ impl ResponseAccumulator {
                         .and_then(|v| v.as_str())
                         .unwrap_or(&title)
                         .to_string();
-                    let arguments = d
-                        .get("arguments")
-                        .or_else(|| d.get("params"))
-                        .map(|v| v.as_str().map(|s| s.to_string()).unwrap_or_else(|| v.to_string()))
-                        .unwrap_or_else(|| "{}".to_string());
-                    let summary_text = format!("Called tool: {} with arguments: {}", name, arguments);
-                    let item = OutputItem::Reasoning {
-                        id: format!("rs_{}", tool_call_id),
-                        summary: vec![ReasoningSummary {
-                            summary_type: "tool_call".to_string(),
-                            text: summary_text,
-                        }],
-                    };
-                    let output_index = self.output_items.len();
-                    self.output_items.push(item.clone());
-                    return Some(ResponseEvent::OutputItemAdded {
-                        sequence_number: self.next_seq(),
-                        output_index,
-                        item,
-                    });
+
+                    // Branch: client-defined tool → FunctionCall, agent-internal → Reasoning
+                    if self.consumer_tool_names.iter().any(|n| n == &name) {
+                        let arguments = extract_tool_call_arguments(d);
+                        // Skip probing calls with no arguments
+                        if arguments == "{}" {
+                            debug!(tool_name = %name, "ACP client tool_call (probing, no args) — silently dropped");
+                            return None;
+                        }
+                        info!(tool_name = %name, "ACP client tool_call — forwarding as FunctionCall");
+                        let call_id = tool_call_id.clone();
+                        let item = OutputItem::FunctionCall {
+                            id: generate_call_id(),
+                            call_id,
+                            name: name.clone(),
+                            arguments,
+                            status: "completed".to_string(),
+                        };
+                        let output_index = self.output_items.len();
+                        self.output_items.push(item.clone());
+                        return Some(ResponseEvent::OutputItemAdded {
+                            sequence_number: self.next_seq(),
+                            output_index,
+                            item,
+                        });
+                    } else {
+                        let arguments = d
+                            .get("arguments")
+                            .or_else(|| d.get("params"))
+                            .map(|v| v.as_str().map(|s| s.to_string()).unwrap_or_else(|| v.to_string()))
+                            .unwrap_or_else(|| "{}".to_string());
+                        let summary_text = format!("Called tool: {} with arguments: {}", name, arguments);
+                        let item = OutputItem::Reasoning {
+                            id: format!("rs_{}", tool_call_id),
+                            summary: vec![ReasoningSummary {
+                                summary_type: "tool_call".to_string(),
+                                text: summary_text,
+                            }],
+                        };
+                        let output_index = self.output_items.len();
+                        self.output_items.push(item.clone());
+                        return Some(ResponseEvent::OutputItemAdded {
+                            sequence_number: self.next_seq(),
+                            output_index,
+                            item,
+                        });
+                    }
                 }
                 None
             }
             _ => None,
         }
+    }
+
+    /// Live-streaming variant of `process_update` that yields a `Vec` so
+    /// both the item-added event and the first delta can be yielded together.
+    pub fn process_update_events(&mut self, update: &SessionUpdate) -> Vec<ResponseEvent> {
+        let update_type = Self::update_type_of(update);
+        let is_first_message_chunk = self.current_message.is_none() && update_type == "agent_message_chunk";
+        let added_event = self.process_update(update);
+        let is_item_added_message = matches!(&added_event, Some(ResponseEvent::OutputItemAdded { item: OutputItem::Message { .. }, .. }));
+
+        let mut events = match added_event {
+            Some(event) => vec![event],
+            None => vec![],
+        };
+
+        if is_first_message_chunk && is_item_added_message
+            && let Some(msg) = self.current_message.as_ref().filter(|m| !m.text.is_empty())
+        {
+            let item_id = msg.id.clone();
+            let delta = msg.text.clone();
+            let output_index = self.output_items.len();
+            events.push(ResponseEvent::OutputTextDelta {
+                sequence_number: self.next_seq(),
+                item_id,
+                output_index,
+                content_index: 0,
+                delta,
+            });
+        }
+
+        // tool_call_update: update arguments on the matching FunctionCall output item
+        if update_type == "tool_call_update" {
+            let data = update
+                .body
+                .get("data")
+                .or_else(|| update.body.get("update"));
+            if let Some(d) = data {
+                let update_call_id = d
+                    .get("tool_call_id")
+                    .or_else(|| d.get("toolCallId"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let new_args = d
+                    .get("arguments")
+                    .or_else(|| d.get("params"))
+                    .or_else(|| d.get("input"))
+                    .or_else(|| d.get("args"))
+                    .map(|v| v.as_str().map(|s| s.to_string()).unwrap_or_else(|| v.to_string()))
+                    .unwrap_or_default();
+                if !update_call_id.is_empty() && !new_args.is_empty() {
+                    // Update the matching FunctionCall's arguments in output_items
+                    for item in self.output_items.iter_mut() {
+                        if let OutputItem::FunctionCall { call_id, arguments, .. } = item {
+                            if call_id == update_call_id {
+                                *arguments = new_args.clone();
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        events
+    }
+
+    fn update_type_of(update: &SessionUpdate) -> &str {
+        update
+            .body
+            .get("updateType")
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                update
+                    .body
+                    .get("update")
+                    .and_then(|u| u.get("sessionUpdate"))
+                    .and_then(|v| v.as_str())
+            })
+            .unwrap_or("")
     }
 
     /// Flush the current thought to output_items as a Reasoning item.
@@ -348,6 +600,34 @@ impl ResponseAccumulator {
 
 pub fn response_to_chat_completion(response: &Response) -> ChatCompletionResponse {
     let message_content = response.output_text.clone();
+
+    let tool_calls: Option<Vec<ToolCall>> = {
+        let calls: Vec<ToolCall> = response
+            .output
+            .iter()
+            .filter_map(|item| match item {
+                OutputItem::FunctionCall {
+                    call_id, name, arguments, ..
+                } => Some(ToolCall {
+                    id: call_id.clone(),
+                    tool_type: "function".to_string(),
+                    function: ToolCallFunction {
+                        name: name.clone(),
+                        arguments: arguments.clone(),
+                    },
+                }),
+                _ => None,
+            })
+            .collect();
+        if calls.is_empty() { None } else { Some(calls) }
+    };
+
+    let finish_reason = if tool_calls.is_some() {
+        "tool_calls".to_string()
+    } else {
+        "stop".to_string()
+    };
+
     ChatCompletionResponse {
         id: response.id.clone(),
         object: "chat.completion",
@@ -357,11 +637,11 @@ pub fn response_to_chat_completion(response: &Response) -> ChatCompletionRespons
             index: 0,
             message: ChatMessage {
                 role: "assistant".to_string(),
-                content: Some(message_content),
-                tool_calls: None,
+                content: if tool_calls.is_some() { None } else { Some(message_content) },
+                tool_calls,
                 tool_call_id: None,
             },
-            finish_reason: "stop".to_string(),
+            finish_reason,
         }],
         usage: ChatUsage {
             prompt_tokens: response.usage.input_tokens,
@@ -685,7 +965,7 @@ mod tests {
 
     #[test]
     fn test_response_accumulator_message() {
-        let mut acc = ResponseAccumulator::new("resp_123".to_string(), "gpt-4".to_string());
+        let mut acc = ResponseAccumulator::new("resp_123".to_string(), "gpt-4".to_string(), vec![]);
         
         let update = SessionUpdate {
             session_id: "sess_1".to_string(),
@@ -708,8 +988,8 @@ mod tests {
     }
 
     #[test]
-    fn test_response_accumulator_tool_call() {
-        let mut acc = ResponseAccumulator::new("resp_123".to_string(), "gpt-4".to_string());
+    fn test_response_accumulator_internal_tool_call() {
+        let mut acc = ResponseAccumulator::new("resp_123".to_string(), "gpt-4".to_string(), vec![]);
         
         let update = SessionUpdate {
             session_id: "sess_1".to_string(),
@@ -734,7 +1014,7 @@ mod tests {
                 assert_eq!(summary[0].summary_type, "tool_call");
                 assert!(summary[0].text.contains("get_weather"));
             }
-            _ => panic!("Expected Reasoning for tool call, got {:?}", response.output[0]),
+            _ => panic!("Expected Reasoning for internal tool call, got {:?}", response.output[0]),
         }
     }
 
@@ -742,7 +1022,7 @@ mod tests {
 
     #[test]
     fn test_agent_thought_chunk_produces_reasoning() {
-        let mut acc = ResponseAccumulator::new("resp_1".to_string(), "gpt-4".to_string());
+        let mut acc = ResponseAccumulator::new("resp_1".to_string(), "gpt-4".to_string(), vec![]);
         let update = SessionUpdate {
             session_id: "sess_1".to_string(),
             body: json!({
@@ -762,7 +1042,7 @@ mod tests {
 
     #[test]
     fn test_agent_message_chunk_produces_message_only() {
-        let mut acc = ResponseAccumulator::new("resp_2".to_string(), "gpt-4".to_string());
+        let mut acc = ResponseAccumulator::new("resp_2".to_string(), "gpt-4".to_string(), vec![]);
         let update = SessionUpdate {
             session_id: "sess_1".to_string(),
             body: json!({
@@ -789,7 +1069,7 @@ mod tests {
 
     #[test]
     fn test_thinking_not_in_output_text() {
-        let mut acc = ResponseAccumulator::new("resp_3".to_string(), "gpt-4".to_string());
+        let mut acc = ResponseAccumulator::new("resp_3".to_string(), "gpt-4".to_string(), vec![]);
 
         let thought = SessionUpdate {
             session_id: "sess_1".to_string(),
@@ -823,8 +1103,8 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_call_produces_reasoning_not_function_call() {
-        let mut acc = ResponseAccumulator::new("resp_4".to_string(), "gpt-4".to_string());
+    fn test_internal_tool_call_produces_reasoning_not_function_call() {
+        let mut acc = ResponseAccumulator::new("resp_4".to_string(), "gpt-4".to_string(), vec![]);
         let update = SessionUpdate {
             session_id: "sess_1".to_string(),
             body: json!({
@@ -842,7 +1122,7 @@ mod tests {
 
         assert_eq!(response.output.len(), 1, "expected exactly one output item");
         let has_function_call = response.output.iter().any(|item| matches!(item, OutputItem::FunctionCall { .. }));
-        assert!(!has_function_call, "tool_call should NOT produce FunctionCall items");
+        assert!(!has_function_call, "internal tool_call should NOT produce FunctionCall items");
 
         match &response.output[0] {
             OutputItem::Reasoning { summary, .. } => {
@@ -857,7 +1137,7 @@ mod tests {
 
     #[test]
     fn test_thought_then_message_then_thought_separate_items() {
-        let mut acc = ResponseAccumulator::new("resp_5".to_string(), "gpt-4".to_string());
+        let mut acc = ResponseAccumulator::new("resp_5".to_string(), "gpt-4".to_string(), vec![]);
 
         let t1 = SessionUpdate {
             session_id: "sess_1".to_string(),
@@ -890,7 +1170,7 @@ mod tests {
 
     #[test]
     fn test_process_update_thought_emits_output_item_added() {
-        let mut acc = ResponseAccumulator::new("resp_6".to_string(), "gpt-4".to_string());
+        let mut acc = ResponseAccumulator::new("resp_6".to_string(), "gpt-4".to_string(), vec![]);
         let update = SessionUpdate {
             session_id: "sess_1".to_string(),
             body: json!({
@@ -911,7 +1191,7 @@ mod tests {
 
     #[test]
     fn test_process_update_tool_call_emits_reasoning_event() {
-        let mut acc = ResponseAccumulator::new("resp_7".to_string(), "gpt-4".to_string());
+        let mut acc = ResponseAccumulator::new("resp_7".to_string(), "gpt-4".to_string(), vec![]);
         let update = SessionUpdate {
             session_id: "sess_1".to_string(),
             body: json!({
@@ -1050,6 +1330,178 @@ mod tests {
         for chunk in &content_chunks {
             assert_eq!(chunk.choices[0].delta.role, None, "content chunks should not set role");
             assert!(chunk.choices[0].delta.content.is_some(), "content chunks should have content delta");
+        }
+    }
+}
+
+pub fn chat_final_chunk(chat_id: &str, model: &str, created: i64, finish_reason: &str) -> ChatCompletionChunk {
+    ChatCompletionChunk {
+        id: chat_id.to_string(),
+        object: "chat.completion.chunk",
+        created,
+        model: model.to_string(),
+        choices: vec![ChatChoiceDelta {
+            index: 0,
+            delta: ChatMessageDelta::default(),
+            finish_reason: Some(finish_reason.to_string()),
+        }],
+        usage: Some(ChatUsage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }),
+    }
+}
+
+pub struct ChatChunkAccumulator {
+    pub chat_id: String,
+    pub model: String,
+    pub created: i64,
+    pub role_sent: bool,
+    pub consumer_tool_names: Vec<String>,
+    pub had_client_tool_call: bool,
+}
+
+impl ChatChunkAccumulator {
+    pub fn new(chat_id: String, model: String, created: i64, consumer_tool_names: Vec<String>) -> Self {
+        Self { chat_id, model, created, role_sent: false, consumer_tool_names, had_client_tool_call: false }
+    }
+
+    pub fn process_update(&mut self, update: &SessionUpdate) -> Option<ChatCompletionChunk> {
+        let update_type = update
+            .body
+            .get("updateType")
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                update
+                    .body
+                    .get("update")
+                    .and_then(|u| u.get("sessionUpdate"))
+                    .and_then(|v| v.as_str())
+            })
+            .unwrap_or("");
+
+        let data = update
+            .body
+            .get("data")
+            .or_else(|| update.body.get("update"));
+
+        match update_type {
+            "agent_message_chunk" => {
+                let text = data.and_then(|d| {
+                    d.get("content")
+                        .and_then(|c| c.get("text"))
+                        .and_then(|v| v.as_str())
+                        .or_else(|| {
+                            d.get("content").or_else(|| d.get("text")).and_then(|v| v.as_str())
+                        })
+                })?;
+
+                if !self.role_sent {
+                    self.role_sent = true;
+                    return Some(self.build_chunk(ChatMessageDelta {
+                        role: Some("assistant".to_string()),
+                        content: Some(text.to_string()),
+                        tool_calls: None,
+                    }));
+                }
+
+                Some(self.build_chunk(ChatMessageDelta {
+                    role: None,
+                    content: Some(text.to_string()),
+                    tool_calls: None,
+                }))
+            }
+            "agent_thought_chunk" => None,
+            "tool_call" => {
+                let tool_name = data
+                    .and_then(|d| d.get("name").or_else(|| d.get("title")).and_then(|v| v.as_str()))
+                    .unwrap_or("");
+                let tool_call_id = data
+                    .and_then(|d| d.get("toolCallId").or_else(|| d.get("tool_call_id")).and_then(|v| v.as_str()))
+                    .unwrap_or("");
+                let arguments = data
+                    .and_then(|d| {
+                        d.get("arguments")
+                            .or_else(|| d.get("params"))
+                            .and_then(|v| v.as_str().map(|s| s.to_string()).or_else(|| Some(v.to_string())))
+                    })
+                    .unwrap_or_default();
+
+                if tool_call_id.is_empty() || tool_name.is_empty() {
+                    return None;
+                }
+
+                // Consumer tool: emit tool_calls delta
+                if self.consumer_tool_names.contains(&tool_name.to_string()) {
+                    // Skip probing calls (empty arguments)
+                    if arguments.trim() == "{}" {
+                        debug!("ACP tool_call (chat, consumer) — probing call silently consumed");
+                        return None;
+                    }
+                    self.had_client_tool_call = true;
+                    self.role_sent = true;
+                    let tc = ToolCall {
+                        id: tool_call_id.to_string(),
+                        tool_type: "function".to_string(),
+                        function: ToolCallFunction {
+                            name: tool_name.to_string(),
+                            arguments: arguments.clone(),
+                        },
+                    };
+                    return Some(self.build_chunk(ChatMessageDelta {
+                        role: Some("assistant".to_string()),
+                        content: None,
+                        tool_calls: Some(vec![tc]),
+                    }));
+                }
+
+                // Agent-internal tool: silently consume
+                debug!("ACP tool_call (chat, agent-internal) — silently dropped");
+                None
+            }
+            "tool_call_update" => {
+                let update_call_id = data
+                    .and_then(|d| d.get("tool_call_id").or_else(|| d.get("toolCallId")).and_then(|v| v.as_str()))
+                    .unwrap_or("");
+                let new_args = data
+                    .and_then(|d| {
+                        d.get("arguments")
+                            .or_else(|| d.get("params"))
+                            .and_then(|v| v.as_str().map(|s| s.to_string()).or_else(|| Some(v.to_string())))
+                    })
+                    .unwrap_or_default();
+
+                if update_call_id.is_empty() || new_args.is_empty() {
+                    return None;
+                }
+
+                // Emit a delta chunk with updated arguments on the same call id
+                // The index is 0 because we only emit one tool_call per chunk
+                Some(self.build_chunk(ChatMessageDelta {
+                    role: None,
+                    content: None,
+                    tool_calls: Some(vec![ToolCall {
+                        id: update_call_id.to_string(),
+                        tool_type: "function".to_string(),
+                        function: ToolCallFunction {
+                            name: "".to_string(), // name not sent on update
+                            arguments: new_args,
+                        },
+                    }]),
+                }))
+            }
+            other => {
+                debug!(update_type = other, "Unhandled ACP session update type (chat, silently dropped)");
+                None
+            }
+        }
+    }
+
+    fn build_chunk(&self, delta: ChatMessageDelta) -> ChatCompletionChunk {
+        ChatCompletionChunk {
+            id: self.chat_id.clone(),
+            object: "chat.completion.chunk",
+            created: self.created,
+            model: self.model.clone(),
+            choices: vec![ChatChoiceDelta { index: 0, delta, finish_reason: None }],
+            usage: None,
         }
     }
 }

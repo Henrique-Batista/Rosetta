@@ -8,9 +8,11 @@ use std::sync::Arc;
 use tracing::{error, info};
 
 use rosetta_types::openai::*;
+use rosetta_types::acp::ContentBlock;
 use rosetta_acp::client::AcpClient;
 use rosetta_core::translate::*;
 use crate::streaming;
+use crate::streaming_task::{spawn_streaming_prompt, StreamOutcome, STREAM_CHANNEL_CAPACITY};
 
 pub struct AppState {
     pub acp_command: String,
@@ -119,36 +121,94 @@ async fn create_response(
     })?;
     let session_id = session_resp.session_id;
 
-    if let Some(agent_name) = agent
-        && let Err(e) = configure_agent(&mut client, &session_id, &agent_name, &session_resp.config_options).await {
+    if let Some(agent_name) = agent {
+        if let Err(e) = configure_agent(&mut client, &session_id, &agent_name, &session_resp.config_options).await {
             error!("Failed to configure agent: {}", e);
+        }
     }
 
-    let prompt = openai_input_to_acp_prompt(req.input.as_ref().unwrap_or(&ResponseInput::Text(String::new())));
+    let mut prompt = openai_input_to_acp_prompt(req.input.as_ref().unwrap_or(&ResponseInput::Text(String::new())));
+    let consumer_tool_names: Vec<String> = req.tools.iter().map(|t| t.name.clone()).collect();
+    if !consumer_tool_names.is_empty() {
+        let harness = format_rosetta_harness_prompt(&consumer_tool_names);
+        let tools_text = format_response_tool_definitions(&req.tools);
+        prompt.insert(0, ContentBlock::Text { text: harness });
+        prompt.insert(0, ContentBlock::Text { text: tools_text });
+    } else if !req.tools.is_empty() {
+        let tools_text = format_response_tool_definitions(&req.tools);
+        prompt.insert(0, ContentBlock::Text { text: tools_text });
+    }
+
+    if is_streaming {
+        let rx = spawn_streaming_prompt(client, session_id, prompt, STREAM_CHANNEL_CAPACITY);
+        let event_stream = build_live_response_events(rx, response_id, model, consumer_tool_names);
+        return Ok(streaming::response_event_stream_to_sse(event_stream).into_response());
+    }
+
     let _prompt_resp = client.send_prompt(&session_id, prompt).await.map_err(|e| {
-        error!("Failed to send ACP prompt: {}", e);
+        error!("Failed to send prompt: {}", e);
         axum::http::StatusCode::INTERNAL_SERVER_ERROR
     })?;
-
     let updates = client.read_updates().await.map_err(|e| {
-        error!("Failed to read ACP updates: {}", e);
+        error!("Failed to read updates: {}", e);
         axum::http::StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let _ = client.close_session(&session_id).await;
-
-    let mut accumulator = ResponseAccumulator::new(response_id.clone(), model.clone());
+    let mut accumulator = ResponseAccumulator::new(response_id, model, consumer_tool_names);
     for update in &updates {
-        accumulator.process_update(update);
+        accumulator.process_update_events(update);
     }
     let response = accumulator.finalize();
 
-    if is_streaming {
-        let events = response_to_streaming_events(&response);
-        Ok(streaming::response_events_to_sse(events).into_response())
-    } else {
-        Ok(Json(response).into_response())
+    let _ = client.close_session(&session_id).await;
+
+    Ok(Json(response).into_response())
+}
+
+/// Build the live `ResponseEvent` stream from a streaming task's
+/// `StreamOutcome` channel: bookend events first, then a per-update event
+/// as each `SessionUpdate` arrives, then a terminal `ResponseCompleted`/
+/// `Error` event once the underlying agent turn ends.
+fn build_live_response_events(
+    mut rx: tokio::sync::mpsc::Receiver<StreamOutcome>,
+    response_id: String,
+    model: String,
+    consumer_tool_names: Vec<String>,
+) -> impl futures::Stream<Item = ResponseEvent> {
+    async_stream::stream! {
+        let mut accumulator = ResponseAccumulator::new(response_id, model, consumer_tool_names);
+        yield ResponseEvent::ResponseCreated { sequence_number: 0 };
+        yield ResponseEvent::ResponseInProgress { sequence_number: 1 };
+
+        while let Some(outcome) = rx.recv().await {
+            match outcome {
+                StreamOutcome::Update(update) => {
+                    for event in accumulator.process_update_events(&update) {
+                        yield event;
+                    }
+                }
+                StreamOutcome::Done => {
+                    let response = accumulator.finalize();
+                    let seq = response_completed_seq(&accumulator);
+                    yield ResponseEvent::ResponseCompleted { sequence_number: seq, response };
+                    return;
+                }
+                StreamOutcome::Error(message) => {
+                    let seq = response_completed_seq(&accumulator);
+                    yield ResponseEvent::Error {
+                        sequence_number: seq,
+                        code: "agent_error".to_string(),
+                        message,
+                    };
+                    return;
+                }
+            }
+        }
     }
+}
+
+fn response_completed_seq(accumulator: &ResponseAccumulator) -> u32 {
+    accumulator.sequence_number + 1
 }
 
 async fn create_chat_completion(
@@ -174,30 +234,81 @@ async fn create_chat_completion(
             error!("Failed to configure agent: {}", e);
     }
 
-    let prompt = chat_messages_to_acp_prompt(&req.messages);
+    let mut prompt = chat_messages_to_acp_prompt(&req.messages);
+    let consumer_tool_names: Vec<String> = req.tools.iter().map(|t| t.function.name.clone()).collect();
+    if !consumer_tool_names.is_empty() {
+        let harness = format_rosetta_harness_prompt(&consumer_tool_names);
+        let tools_text = format_chat_tool_definitions(&req.tools);
+        prompt.insert(0, ContentBlock::Text { text: harness });
+        prompt.insert(0, ContentBlock::Text { text: tools_text });
+    } else if !req.tools.is_empty() {
+        let tools_text = format_chat_tool_definitions(&req.tools);
+        prompt.insert(0, ContentBlock::Text { text: tools_text });
+    }
+
+    if is_streaming {
+        let chat_id = format!("chatcmpl-{}", &response_id);
+        let created = chrono::Utc::now().timestamp();
+        let rx = spawn_streaming_prompt(client, session_id, prompt, STREAM_CHANNEL_CAPACITY);
+        let event_stream = build_live_chat_sse_events(rx, chat_id, model, created, consumer_tool_names);
+        return Ok(axum::response::sse::Sse::new(event_stream).into_response());
+    }
+
     let _prompt_resp = client.send_prompt(&session_id, prompt).await.map_err(|e| {
-        error!("Failed to send ACP prompt: {}", e);
+        error!("Failed to send prompt: {}", e);
         axum::http::StatusCode::INTERNAL_SERVER_ERROR
     })?;
-
     let updates = client.read_updates().await.map_err(|e| {
-        error!("Failed to read ACP updates: {}", e);
+        error!("Failed to read updates: {}", e);
         axum::http::StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let _ = client.close_session(&session_id).await;
-
-    let mut accumulator = ResponseAccumulator::new(response_id, model);
+    let mut accumulator = ResponseAccumulator::new(response_id, model, consumer_tool_names);
     for update in &updates {
-        accumulator.process_update(update);
+        accumulator.process_update_events(update);
     }
     let response = accumulator.finalize();
 
-    if is_streaming {
-        let chat_chunks = response_to_chat_chunks(&response);
-        Ok(streaming::chat_chunks_to_sse(chat_chunks).into_response())
-    } else {
-        let chat_response = response_to_chat_completion(&response);
-        Ok(Json(chat_response).into_response())
+    let _ = client.close_session(&session_id).await;
+
+    let chat_response = response_to_chat_completion(&response);
+    Ok(Json(chat_response).into_response())
+}
+
+/// Build the live Chat Completions SSE `Event` stream from a streaming
+/// task's `StreamOutcome` channel. The `[DONE]` sentinel is appended ONLY on
+/// normal completion (`StreamOutcome::Done`); on `StreamOutcome::Error` the
+/// stream ends immediately without a synthetic finish chunk or `[DONE]`,
+/// matching the contract in `specs/001-true-streaming/contracts/chat-completions-sse-chunks.md`
+/// ("the stream ends WITHOUT emitting chunk (3) or the [DONE] sentinel").
+fn build_live_chat_sse_events(
+    mut rx: tokio::sync::mpsc::Receiver<StreamOutcome>,
+    chat_id: String,
+    model: String,
+    created: i64,
+    consumer_tool_names: Vec<String>,
+) -> impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>> {
+    async_stream::stream! {
+        let mut accumulator = ChatChunkAccumulator::new(chat_id.clone(), model.clone(), created, consumer_tool_names);
+
+        while let Some(outcome) = rx.recv().await {
+            match outcome {
+                StreamOutcome::Update(update) => {
+                    if let Some(chunk) = accumulator.process_update(&update) {
+                        let data = serde_json::to_string(&chunk).unwrap_or_default();
+                        yield Ok(axum::response::sse::Event::default().data(data));
+                    }
+                }
+                StreamOutcome::Done => {
+                    let finish_reason = if accumulator.had_client_tool_call { "tool_calls" } else { "stop" };
+                    let chunk = chat_final_chunk(&chat_id, &model, created, finish_reason);
+                    let data = serde_json::to_string(&chunk).unwrap_or_default();
+                    yield Ok(axum::response::sse::Event::default().data(data));
+                    yield Ok(axum::response::sse::Event::default().data("[DONE]"));
+                    return;
+                }
+                StreamOutcome::Error(_) => return,
+            }
+        }
     }
 }

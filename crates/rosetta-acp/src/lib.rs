@@ -1,7 +1,7 @@
 pub mod client;
 pub mod transport;
 
-pub use client::AcpClient;
+pub use client::{AcpClient, AcpStreamItem};
 pub use transport::AcpTransport;
 
 use thiserror::Error;

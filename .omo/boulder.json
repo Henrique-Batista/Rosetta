@@ -1,0 +1,113 @@
+{
+  "schema_version": 2,
+  "active_work_id": "consumer-tool-calling",
+  "works": {
+    "consumer-tool-calling": {
+      "work_id": "consumer-tool-calling",
+      "active_plan": "/home/pablitux/RustroverProjects/Rosetta/.omo/plans/consumer-tool-calling.md",
+      "plan_name": "consumer-tool-calling",
+      "status": "completed",
+      "started_at": "2026-07-09T19:20:11.809Z",
+      "updated_at": "2026-07-09T19:40:02.143Z",
+      "session_ids": [
+        "opencode:ses_0b7fa2e8cffeyVg9rLvPJvbGr2"
+      ],
+      "session_origins": {
+        "opencode:ses_0b7fa2e8cffeyVg9rLvPJvbGr2": "direct"
+      },
+      "agent": "atlas",
+      "task_sessions": {
+        "T1": {
+          "status": "completed",
+          "elapsed_ms": 171000
+        },
+        "T2": {
+          "status": "completed",
+          "elapsed_ms": 0
+        },
+        "T3": {
+          "status": "completed",
+          "elapsed_ms": 157000
+        },
+        "T4": {
+          "status": "completed",
+          "elapsed_ms": 0
+        },
+        "T5": {
+          "status": "completed",
+          "elapsed_ms": 109000
+        },
+        "T6": {
+          "status": "completed",
+          "elapsed_ms": 269000
+        },
+        "T7": {
+          "status": "completed",
+          "elapsed_ms": 52000
+        },
+        "T8": {
+          "status": "completed",
+          "elapsed_ms": 0
+        },
+        "F1-F4": {
+          "status": "completed",
+          "elapsed_ms": 0
+        }
+      },
+      "ended_at": "2026-07-09T19:40:02.143Z",
+      "elapsed_ms": 1190334
+    }
+  },
+  "active_plan": "/home/pablitux/RustroverProjects/Rosetta/.omo/plans/consumer-tool-calling.md",
+  "started_at": "2026-07-09T19:20:11.809Z",
+  "status": "completed",
+  "updated_at": "2026-07-09T19:40:02.143Z",
+  "session_ids": [
+    "opencode:ses_0b7fa2e8cffeyVg9rLvPJvbGr2"
+  ],
+  "session_origins": {
+    "opencode:ses_0b7fa2e8cffeyVg9rLvPJvbGr2": "direct"
+  },
+  "plan_name": "consumer-tool-calling",
+  "task_sessions": {
+    "T1": {
+      "status": "completed",
+      "elapsed_ms": 171000
+    },
+    "T2": {
+      "status": "completed",
+      "elapsed_ms": 0
+    },
+    "T3": {
+      "status": "completed",
+      "elapsed_ms": 157000
+    },
+    "T4": {
+      "status": "completed",
+      "elapsed_ms": 0
+    },
+    "T5": {
+      "status": "completed",
+      "elapsed_ms": 109000
+    },
+    "T6": {
+      "status": "completed",
+      "elapsed_ms": 269000
+    },
+    "T7": {
+      "status": "completed",
+      "elapsed_ms": 52000
+    },
+    "T8": {
+      "status": "completed",
+      "elapsed_ms": 0
+    },
+    "F1-F4": {
+      "status": "completed",
+      "elapsed_ms": 0
+    }
+  },
+  "agent": "atlas",
+  "ended_at": "2026-07-09T19:40:02.143Z",
+  "elapsed_ms": 1190334
+}

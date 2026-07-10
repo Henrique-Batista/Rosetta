@@ -324,10 +324,9 @@ Rosetta é construído sobre o **Agent Client Protocol (ACP)**, definido de fato
 ## Notas importantes
 
 - **Parâmetros de runtime** (`temperature`, `top_p`, etc.) são ignorados conforme a spec ACP — não são repassados ao agente.
-- **Streaming**: Rosetta suporta dois caminhos de streaming:
-  - Responses API: usa `response_to_streaming_events()` para gerar eventos SSE corretos a partir da resposta acumulada
-  - Chat Completions: usa `response_to_chat_chunks()` para dividir o texto em chunks delta palavra por palavra, com o devido enquadramento de `role`/`finish_reason`/`usage`
-  - Um método de streaming verdadeiro (`send_prompt_streaming()`) está disponível em `AcpClient` via `async_stream` para processamento de atualizações ACP em tempo real
+- **Streaming**: para requisições com `stream: true`, ambas as APIs agora entregam o conteúdo em tempo real, conforme o agente ACP o produz, em vez de coletar todo o turno primeiro:
+  - Responses API e Chat Completions consomem `AcpClient::send_prompt_streaming()` através de um canal limitado (bounded) de propriedade da task (`rosetta-server/src/streaming_task.rs`), traduzindo cada `session/update` em um evento/chunk SSE assim que ele chega
+  - Requisições não-streaming (`stream: false`) não são afetadas e continuam usando as versões em modo batch `response_to_streaming_events()`/`response_to_chat_chunks()`, `response_to_chat_completion()`
 - **Servidores MCP** são passados através do campo padrão-ACP `mcpServers` em `session/new` — configure via flag `--mcp-servers` ou variável `ROSETTA_MCP_SERVERS`
 - O enum `InputItem` exige `"type": "message"` no array de input.
 - Nomes de campo ACP usam `camelCase` (ex.: `protocolVersion`, `sessionId`).

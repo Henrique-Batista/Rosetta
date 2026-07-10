@@ -1,15 +1,10 @@
-mod cli;
-mod routes;
-mod streaming;
-
 use std::sync::Arc;
 
 use clap::Parser;
 use tracing::info;
 
-use crate::cli::Cli;
-use crate::routes::AppState;
-
+use rosetta_server::cli::Cli;
+use rosetta_server::routes::{self, AppState};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
