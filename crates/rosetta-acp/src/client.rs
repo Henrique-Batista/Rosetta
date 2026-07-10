@@ -28,6 +28,7 @@ pub struct AcpClient {
 
 impl AcpClient {
     /// Create a new client from an existing transport.
+    #[must_use]
     pub fn new(transport: AcpTransport) -> Self {
         Self {
             transport,
@@ -127,10 +128,6 @@ impl AcpClient {
             }
             loop {
                 match self.transport.read_line().await {
-                    Ok(None) => {
-                        yield AcpStreamItem::Disconnected;
-                        return;
-                    }
                     Ok(Some(line)) => {
                         if let Some(update) = self.try_parse_notification::<SessionUpdate>(&line) {
                             if update.session_id == session_id {
@@ -146,7 +143,7 @@ impl AcpClient {
                         yield AcpStreamItem::Completed;
                         return;
                     }
-                    Err(_) => {
+                    Ok(None) | Err(_) => {
                         yield AcpStreamItem::Disconnected;
                         return;
                     }

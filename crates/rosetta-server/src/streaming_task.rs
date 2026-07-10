@@ -13,11 +13,25 @@ pub const STREAM_CHANNEL_CAPACITY: usize = 32;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// One item forwarded from the streaming task to the HTTP handler.
-#[derive(Debug)]
 pub enum StreamOutcome {
     Update(SessionUpdate),
-    Done,
+    /// Normal completion: the caller receives ownership of `client` back so
+    /// it can decide whether to cache the session for a continuation
+    /// request or shut it down immediately.
+    DoneWithCache { client: Box<AcpClient>, session_id: String },
     Error(String),
+}
+
+impl std::fmt::Debug for StreamOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Update(update) => f.debug_tuple("Update").field(update).finish(),
+            Self::DoneWithCache { session_id, .. } => {
+                f.debug_struct("DoneWithCache").field("session_id", session_id).finish_non_exhaustive()
+            }
+            Self::Error(message) => f.debug_tuple("Error").field(message).finish(),
+        }
+    }
 }
 
 /// Spawn a task that owns `client` for the lifetime of one streaming prompt,
@@ -59,20 +73,21 @@ pub fn spawn_streaming_prompt(
             disconnected
         };
 
-        let shutdown_result =
-            tokio::time::timeout(SHUTDOWN_TIMEOUT, client.shutdown()).await;
-        match shutdown_result {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => warn!(error = %e, "ACP client shutdown returned an error"),
-            Err(_) => warn!("ACP client shutdown timed out"),
-        }
-
         if outcome {
+            let shutdown_result =
+                tokio::time::timeout(SHUTDOWN_TIMEOUT, client.shutdown()).await;
+            match shutdown_result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!(error = %e, "ACP client shutdown returned an error"),
+                Err(_) => warn!("ACP client shutdown timed out"),
+            }
             let _ = tx
                 .send(StreamOutcome::Error("agent disconnected mid-turn".to_string()))
                 .await;
         } else {
-            let _ = tx.send(StreamOutcome::Done).await;
+            // Return client ownership via DoneWithCache — the caller decides
+            // whether to cache the session or shut it down.
+            let _ = tx.send(StreamOutcome::DoneWithCache { client: Box::new(client), session_id }).await;
         }
     });
 
@@ -114,8 +129,9 @@ mod tests {
         while let Some(outcome) = rx.recv().await {
             match outcome {
                 StreamOutcome::Update(_) => update_count += 1,
-                StreamOutcome::Done => {
+                StreamOutcome::DoneWithCache { client, .. } => {
                     saw_done = true;
+                    client.shutdown().await.expect("shutdown");
                     break;
                 }
                 StreamOutcome::Error(e) => panic!("unexpected error outcome: {e}"),
@@ -138,7 +154,7 @@ mod tests {
             while let Some(outcome) = rx.recv().await {
                 match outcome {
                     StreamOutcome::Update(_) => update_count += 1,
-                    StreamOutcome::Done => panic!("expected Error outcome, got Done"),
+                    StreamOutcome::DoneWithCache { .. } => panic!("expected Error outcome, got DoneWithCache"),
                     StreamOutcome::Error(_) => {
                         saw_error = true;
                         break;
@@ -163,8 +179,13 @@ mod tests {
         let mut count = 0;
         while let Some(outcome) = rx.recv().await {
             tokio::time::sleep(StdDuration::from_millis(30)).await;
-            if matches!(outcome, StreamOutcome::Done | StreamOutcome::Error(_)) {
-                break;
+            match outcome {
+                StreamOutcome::DoneWithCache { client, .. } => {
+                    client.shutdown().await.expect("shutdown");
+                    break;
+                }
+                StreamOutcome::Error(_) => break,
+                StreamOutcome::Update(_) => {}
             }
             count += 1;
         }

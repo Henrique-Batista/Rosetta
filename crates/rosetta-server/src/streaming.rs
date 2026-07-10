@@ -91,7 +91,7 @@ mod tests {
             model: "gpt-4".to_string(),
             choices: vec![ChatChoiceDelta {
                 index: 0,
-                delta: ChatMessageDelta { role: None, content: Some(content.to_string()), tool_calls: None },
+                delta: ChatMessageDelta { role: None, content: Some(content.to_string()), reasoning_content: None, tool_calls: None },
                 finish_reason: None,
             }],
             usage: None,

@@ -1,10 +1,12 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
 use tracing::info;
 
 use rosetta_server::cli::Cli;
 use rosetta_server::routes::{self, AppState};
+use rosetta_server::session_cache::SessionCache;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -24,6 +26,9 @@ async fn main() -> anyhow::Result<()> {
         acp_args: cfg.acp_args,
         cwd: cfg.cwd,
         mcp_servers: cfg.mcp_servers,
+        session_cache: Arc::new(SessionCache::new(Duration::from_secs(300))),
+        harness_prompt: cfg.harness_prompt,
+        harness_disabled: cfg.harness_disabled,
     });
 
     let app = routes::router(state);

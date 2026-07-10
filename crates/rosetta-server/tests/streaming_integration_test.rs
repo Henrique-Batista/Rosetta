@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use rosetta_server::routes::{router, AppState};
+use rosetta_server::session_cache::SessionCache;
 
 /// The mock agent's per-chunk-delay/crash/echo behavior is configured via
 /// process-global environment variables (inherited by the spawned child at
@@ -40,6 +41,9 @@ async fn start_server(
         acp_args: vec![mock_script()],
         cwd: "/tmp".to_string(),
         mcp_servers: vec![],
+        session_cache: Arc::new(SessionCache::new(Duration::from_secs(300))),
+        harness_prompt: None,
+        harness_disabled: false,
     });
     let app = router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -278,7 +282,7 @@ async fn test_non_streaming_responses_api_unaffected_by_feature() {
 
 #[tokio::test]
 async fn test_non_streaming_chat_completions_unaffected_by_feature() {
-    let (base, _handle, _guard) = start_server(vec![]).await;
+    let (base, _handle, _guard) = start_server(vec![("MOCK_ACP_TOOL_NAME", "grep")]).await;
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("{base}/v1/chat/completions"))
@@ -294,14 +298,11 @@ async fn test_non_streaming_chat_completions_unaffected_by_feature() {
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.expect("valid json");
     assert_eq!(body["object"], "chat.completion");
-    // Consumer tool calls defined in req.tools are forwarded as tool_calls.
-    assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
-    let tool_calls = body["choices"][0]["message"]["tool_calls"].as_array()
-        .expect("consumer tool calls must appear as tool_calls in Chat Completions");
-    assert_eq!(tool_calls[0]["function"]["name"], "get_weather");
-    // Content is null when tool_calls are present.
-    assert!(body["choices"][0]["message"]["content"].is_null(),
-        "message content should be null when tool_calls are present");
+    assert_eq!(body["choices"][0]["finish_reason"], "stop");
+    assert!(body["choices"][0]["message"]["tool_calls"].is_null(),
+        "agent-internal tool calls must NOT appear as tool_calls in Chat Completions");
+    let content = body["choices"][0]["message"]["content"].as_str().unwrap_or("");
+    assert!(!content.is_empty(), "message content should be present");
 }
 
 // --- T012: error/disconnect handling ---
@@ -444,11 +445,12 @@ async fn test_client_disconnect_stops_forwarding_and_releases_resources() {
 
 // --- T014: consumer tool calling ---
 
-/// Consumer tool calls (`get_weather` defined in `tools`) are forwarded as
-/// `function_call` output items in the Responses API non-streaming path.
+/// Consumer tool calls (`get_weather` defined in `tools`) are surfaced as
+/// `reasoning` output items in the Responses API (agent-internal), not
+/// `function_call`, since there is no tool execution loop yet.
 #[tokio::test]
-async fn test_non_streaming_responses_api_consumer_tool_call_as_function_call() {
-    let (base, _handle, _guard) = start_server(vec![]).await;
+async fn test_non_streaming_responses_api_tool_call_shown_as_reasoning() {
+    let (base, _handle, _guard) = start_server(vec![("MOCK_ACP_TOOL_NAME", "grep")]).await;
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("{base}/v1/responses"))
@@ -468,20 +470,29 @@ async fn test_non_streaming_responses_api_consumer_tool_call_as_function_call() 
     let output = body["output"]
         .as_array()
         .expect("response.output should be a JSON array");
-    let fc = output
+    let reasoning = output
         .iter()
-        .find(|item| item["type"] == "function_call")
-        .unwrap_or_else(|| panic!("expected a function_call output item (consumer tool), got: {output:?}"));
+        .find(|item| item["type"] == "reasoning")
+        .unwrap_or_else(|| panic!("expected a reasoning output item (agent-internal tool call), got: {output:?}"));
 
-    assert_eq!(fc["name"], "get_weather");
-    assert!(fc["arguments"].as_str().unwrap_or("").len() > 0, "arguments should be present");
+    let summary = reasoning["summary"]
+        .as_array()
+        .expect("reasoning.summary should be an array");
+    let combined: String = summary
+        .iter()
+        .filter_map(|s| s["text"].as_str())
+        .collect();
+    assert!(
+        combined.contains("grep") || combined.contains("tool"),
+        "reasoning text should reference the tool, got: {combined}"
+    );
 }
 
-/// Consumer tool calls (`get_weather` defined in `tools`) are forwarded as
-/// `tool_calls` in Chat Completions, with `finish_reason: "tool_calls"`.
+/// Consumer tools defined in `req.tools` are treated as agent-internal
+/// (no tool execution loop yet). The response is a normal completion.
 #[tokio::test]
-async fn test_non_streaming_chat_completions_consumer_tool_call_forwarded() {
-    let (base, _handle, _guard) = start_server(vec![]).await;
+async fn test_non_streaming_chat_completions_agent_tool_call_not_forwarded() {
+    let (base, _handle, _guard) = start_server(vec![("MOCK_ACP_TOOL_NAME", "grep")]).await;
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("{base}/v1/chat/completions"))
@@ -496,21 +507,18 @@ async fn test_non_streaming_chat_completions_consumer_tool_call_forwarded() {
         .expect("request failed");
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.expect("valid json");
-    assert_eq!(body["object"], "chat.completion");
-    // Consumer tool calls are forwarded as tool_calls.
-    assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
-    let tool_calls = body["choices"][0]["message"]["tool_calls"].as_array()
-        .expect("consumer tool calls should appear as tool_calls");
-    assert_eq!(tool_calls[0]["function"]["name"], "get_weather");
-    // Content is null when tool_calls are present.
-    assert!(body["choices"][0]["message"]["content"].is_null());
+    assert!(body["choices"][0]["message"]["tool_calls"].is_null(),
+        "agent-internal tool calls must NOT appear as tool_calls");
+    assert_eq!(body["choices"][0]["finish_reason"], "stop");
+    let content = body["choices"][0]["message"]["content"].as_str().unwrap_or("");
+    assert!(!content.is_empty(), "message content should be present");
 }
 
-/// Consumer tool calls (`get_weather` defined in `tools`) produce tool_calls
-/// deltas in the streaming Chat Completions path.
+/// Consumer tool calls produce NO tool_calls deltas in streaming Chat
+/// Completions since they are agent-internal (no execution loop).
 #[tokio::test]
-async fn test_streaming_chat_completions_consumer_tool_call_deltas() {
-    let (base, _handle, _guard) = start_server(vec![]).await;
+async fn test_streaming_chat_completions_content_only_no_tool_calls() {
+    let (base, _handle, _guard) = start_server(vec![("MOCK_ACP_TOOL_NAME", "grep")]).await;
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("{base}/v1/chat/completions"))
@@ -538,17 +546,18 @@ async fn test_streaming_chat_completions_consumer_tool_call_deltas() {
         .map(|d| serde_json::from_str(d).expect("chunk should be valid JSON"))
         .collect();
 
-    // tool_calls deltas MUST appear for consumer tools.
+    // No tool_calls deltas should appear — tool calls are agent-internal.
     let has_tool_calls = chunks.iter().any(|c| {
         c["choices"][0]["delta"]["tool_calls"].is_array()
     });
-    assert!(has_tool_calls, "consumer tool calls must produce tool_calls deltas");
+    assert!(!has_tool_calls, "agent-internal tool calls must NOT produce tool_calls deltas");
 
-    // Verify the tool name in the tool_calls delta.
-    let tc_chunk = chunks.iter().find(|c| {
-        c["choices"][0]["delta"]["tool_calls"].is_array()
-    }).expect("a tool_calls delta chunk should exist");
-    assert_eq!(tc_chunk["choices"][0]["delta"]["tool_calls"][0]["function"]["name"], "get_weather");
+    // The stream should deliver content (message text).
+    let all_content: String = chunks
+        .iter()
+        .filter_map(|c| c["choices"][0]["delta"]["content"].as_str())
+        .collect();
+    assert!(!all_content.is_empty(), "expected content deltas, got none");
 
     // It must terminate with a [DONE] sentinel.
     let has_done = lines.iter().any(|(_, l)| l == "data: [DONE]");

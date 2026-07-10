@@ -37,14 +37,14 @@ The server binary is produced at `target/release/rosetta`.
 
 Rosetta can be configured in **two ways**, which can be freely combined:
 
-1. **Command-line flags** (`--acp-command`, `--acp-arg`, `--cwd`, `--mcp-servers`, `--listen`)
-2. **Environment variables** (`ROSETTA_ACP_COMMAND`, `ROSETTA_ACP_ARGS`, `ROSETTA_CWD`, `ROSETTA_MCP_SERVERS`, `ROSETTA_LISTEN`)
+1. **Command-line flags** (`--acp-command`, `--acp-arg`, `--cwd`, `--mcp-servers`, `--listen`, `--harness-prompt`, `--harness-disabled`)
+2. **Environment variables** (`ROSETTA_ACP_COMMAND`, `ROSETTA_ACP_ARGS`, `ROSETTA_CWD`, `ROSETTA_MCP_SERVERS`, `ROSETTA_LISTEN`, `ROSETTA_HARNESS_PROMPT`, `ROSETTA_HARNESS_DISABLED`)
 
 ### Precedence (highest to lowest)
 
 ```
-1st  CLI flag             (--acp-command, --acp-arg, --cwd, --mcp-servers, --listen)
-2nd  Environment variable  (ROSETTA_ACP_COMMAND, ROSETTA_ACP_ARGS, ROSETTA_CWD, ROSETTA_MCP_SERVERS, ROSETTA_LISTEN)
+1st  CLI flag             (--acp-command, --acp-arg, --cwd, --mcp-servers, --listen, --harness-prompt, --harness-disabled)
+2nd  Environment variable  (ROSETTA_ACP_COMMAND, ROSETTA_ACP_ARGS, ROSETTA_CWD, ROSETTA_MCP_SERVERS, ROSETTA_LISTEN, ROSETTA_HARNESS_PROMPT, ROSETTA_HARNESS_DISABLED)
 3rd  Built-in default value
 ```
 
@@ -59,6 +59,8 @@ Rosetta can be configured in **two ways**, which can be freely combined:
 | `-w, --cwd <PATH>` | `ROSETTA_CWD` | the process's current working directory | Working directory sent to the agent in `session/new` |
 | `-m, --mcp-servers <JSON>` | `ROSETTA_MCP_SERVERS` | `[]` (none) | JSON array of MCP server configurations, passed through via `session/new`. Invalid JSON aborts the process with a clear error |
 | `-l, --listen <HOST:PORT>` | `ROSETTA_LISTEN` | `0.0.0.0:3000` | Address/port the HTTP server listens on |
+| `--harness-prompt <TEMPLATE>` | `ROSETTA_HARNESS_PROMPT` | *(built-in template)* | Custom template for the harness prompt (see [Important Notes](#important-notes)). Use `{tools}` as placeholder for the tool list |
+| `--harness-disabled` | `ROSETTA_HARNESS_DISABLED` | `false` | Disable the harness prompt entirely |
 
 See all options and the built-in documentation:
 
@@ -97,6 +99,19 @@ ROSETTA_ACP_ARGS="acp" \
 ```bash
 ./target/release/rosetta \
   --mcp-servers '[{"name":"fs","command":"mcp-fs"}]'
+```
+
+### Example — custom harness prompt via CLI
+
+```bash
+./target/release/rosetta \
+  --harness-prompt "[Rosetta Harness]\nClient tools:\n{tools}\nCall → tool_call(name, args). On failure → retry with your own. Both fail → tell user."
+```
+
+### Example — disable harness prompt via CLI
+
+```bash
+./target/release/rosetta --harness-disabled
 ```
 
 ### Example — CLI overriding environment variables
@@ -234,7 +249,8 @@ Rosetta translates ACP agent updates into OpenAI-compatible response structures:
 |----------------|---------------|-------------|
 | `agent_thought_chunk` | `OutputItem::Reasoning` (type: `reasoning`, summary_type: `thinking`) | Model's internal reasoning |
 | `agent_message_chunk` | `OutputItem::Message` (type: `message`) | Final user-facing text |
-| `tool_call` | `OutputItem::FunctionCall` (type: `function_call`) | Agent's tool invocation (exposed as a proper function call) |
+| `tool_call` (consumer tool) | `OutputItem::FunctionCall` / `tool_calls` chunk | Tool name matches a client-defined tool in `req.tools` → forwarded as a proper function call. Also emitted as `reasoning` for visibility. |
+| `tool_call` (agent-internal) | `OutputItem::Reasoning` or silently consumed | Tool name does NOT match any client-defined tool → shown as `reasoning` in Responses API, silently consumed in Chat Completions. |
 | `available_commands_update` | *(silently dropped — logged at debug level)* | Agent announcing available commands/skills |
 | other types | *(silently dropped — logged at debug level)* | Unhandled update types |
 
@@ -328,6 +344,7 @@ Rosetta is built on top of the **Agent Client Protocol (ACP)**, which is defined
   - Responses API and Chat Completions both consume `AcpClient::send_prompt_streaming()` through a task-owned bounded channel (`rosetta-server/src/streaming_task.rs`), translating each `session/update` into an SSE event/chunk as it arrives
   - Non-streaming (`stream: false`) requests are unaffected and still use `response_to_streaming_events()`/`response_to_chat_chunks()`'s batch-mode siblings, `response_to_chat_completion()`
 - **MCP servers** are passed through the ACP-standard `mcpServers` field in `session/new` — configure via the `--mcp-servers` flag or the `ROSETTA_MCP_SERVERS` variable
+- **Harness Prompt** — when `req.tools` contains client-defined tools, Rosetta injects a short prompt into the ACP agent's context. It tells the agent which tools are client-executed (by name and description), how to call them via `tool_call`, and instructs a fallback strategy: try the client tool first, retry with the agent's own equivalent tool (same name or purpose) on failure, and inform the user if both fail. Customize the prompt by setting the `ROSETTA_HARNESS_PROMPT` environment variable (or the `--harness-prompt` CLI flag) to any template — use `{tools}` as a placeholder for the `- name: description` tool list. Remove it entirely with `ROSETTA_HARNESS_DISABLED=1` or `--harness-disabled`.
 - The `InputItem` enum requires `"type": "message"` in the input array.
 - ACP field names use `camelCase` (e.g., `protocolVersion`, `sessionId`).
 - `Client` input parts that aren't `input_text` (e.g., `input_file`, `input_image`) are silently dropped during prompt translation.

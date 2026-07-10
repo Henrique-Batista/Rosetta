@@ -125,6 +125,8 @@ curl http://localhost:3000/v1/chat/completions \
 | `ROSETTA_ACP_ARGS` | Arguments for the ACP agent (space-separated) | *(none)* |
 | `ROSETTA_CWD` | Working directory passed to the agent on `session/new` | current working directory |
 | `ROSETTA_MCP_SERVERS` | JSON array of MCP server configurations passed to the agent via `session/new` | *(none)* |
+| `ROSETTA_HARNESS_PROMPT` | Custom template for the harness prompt. Use `{tools}` as placeholder for the tool list | *(built-in template)* |
+| `ROSETTA_HARNESS_DISABLED` | Set to `1` to disable the harness prompt entirely | *(not set)* |
 
 **ACP agent configuration:** Rosetta does **not** inject any agent-specific config overrides (e.g., `OPENCODE_CONFIG`). The ACP agent process reads its own configuration naturally — config files, environment variables, or built-in defaults. This ensures Rosetta works with **any** ACP agent without assumptions.
 
@@ -139,6 +141,85 @@ ROSETTA_ACP_ARGS="crates/rosetta-acp/tests/fixtures/mock_acp.py" \
 ```
 
 **Note:** When using the mock agent, the `model` field is ignored. The mock agent always returns a fixed response.
+
+## Testing with a Real ACP Agent (OpenCode)
+
+To test Rosetta against a real opencode agent, start the server with the opencode ACP command:
+
+```bash
+ROSETTA_ACP_COMMAND=opencode \
+ROSETTA_ACP_ARGS="acp" \
+RUST_LOG=rosetta_core=trace \
+./target/release/rosetta
+```
+
+Then send a request with client-defined tools to test the harness prompt and dual tool routing:
+
+```bash
+# Consumer tool call (client-side)
+curl http://localhost:3000/v1/responses \
+  -X POST \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-4",
+    "input": [
+      {"type": "message", "role": "user", "content": "Search the web for rubber ducks"}
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "name": "web_search",
+        "description": "Search the web for information",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {"type": "string", "description": "The search query"}
+          },
+          "required": ["query"]
+        }
+      }
+    ]
+  }'
+```
+
+The response will contain a `FunctionCall` output — the agent correctly routed the tool to the client.
+
+```bash
+# Agent-internal tool call (agent handles it)
+curl http://localhost:3000/v1/responses \
+  -X POST \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-4",
+    "input": [
+      {"type": "message", "role": "user", "content": "Search the web for rubber ducks"}
+    ]
+  }'
+```
+
+Without `tools` in the request, the agent uses its own tools internally and returns a text response.
+
+### Argument Extraction & the `rawInput` Format
+
+The opencode ACP agent often sends tool call arguments nested inside a `rawInput` field rather than as standard `arguments` or top-level parameters. Rosetta's `extract_tool_call_arguments` function handles this by:
+
+1. Checking `arguments`, `params`, `input`, `args` fields (standard formats)
+2. If those yield a plain string (not JSON object/array), falling through to collect top-level fields
+3. In the top-level fallback, detecting `rawInput` and **unpacking** its contents into the top-level arguments object
+
+For example, the agent might send:
+
+```json
+{"toolCallId": "call_1", "name": "websearch", "rawInput": {"query": "rubber ducks", "numResults": 5}}
+```
+
+Rosetta transforms this into OpenAI-compatible arguments:
+
+```json
+{"query": "rubber ducks", "numResults": 5}
+```
+
+Without this unpacking, the client would receive `{"rawInput": {"query": "rubber ducks"}}` which MCP tools would reject (they expect `query` at the top level).
 
 ## Architecture
 
@@ -169,12 +250,16 @@ Tool calls are **dual-routed**: client-defined tools (passed in `req.tools`) bec
 `FunctionCall` output items, while agent-internal tools (skills, MCP) are surfaced as
 `reasoning` items or silently consumed.
 
+When client tools are present, Rosetta injects a **Harness Prompt** telling the agent
+which tools are client-executed (with name + description) and instructing a fallback
+strategy: try client first, retry with own equivalent on failure, inform user if both fail.
+
 | ACP Update Type | OpenAI Output | Description |
 |----------------|---------------|-------------|
 | `agent_thought_chunk` | `OutputItem::Reasoning` (type: `reasoning`, summary_type: `thinking`) | Model's internal reasoning/thinking |
 | `agent_message_chunk` | `OutputItem::Message` (type: `message`) | Final user-facing output text |
-| `tool_call` | `OutputItem::FunctionCall` (type: `function_call`) | **Consumer tool**: name matches a client-defined tool in `req.tools` → forwarded as a proper function call |
-| `tool_call` | *(silently consumed)* | **Agent-internal tool**: name does NOT match any client-defined tool → dropped for Chat Completions, shown as `reasoning` for Responses API |
+| `tool_call` (consumer tool) | `OutputItem::FunctionCall` (type: `function_call`) | Name matches a client-defined tool in `req.tools` → forwarded as a proper function call. Agent falls back to its own equivalent on failure. |
+| `tool_call` (agent-internal) | *(silently consumed)* | Name does NOT match any client-defined tool → dropped for Chat Completions, shown as `reasoning` for Responses API |
 | `available_commands_update` | *(silently dropped — logged at debug level)* | Agent announcing available commands/skills |
 | other types | *(silently dropped — logged at debug level)* | Unhandled update types |
 
@@ -225,7 +310,7 @@ Rosetta is built on top of the **Agent Client Protocol (ACP)**, which is defined
 | **Data payload location** | 🟡 opencode-aligned | Rosetta checks `body.data` and `body.update`. Same dual-format approach as above. |
 | **Update type names** | 🔴 opencode-specific | Only `agent_thought_chunk`, `agent_message_chunk`, and `tool_call` are recognized. All other update types (e.g., `agent_message`, `tool_call_update`, `user_message_chunk`, `plan`, `current_mode_update`) are silently dropped — logged at `debug` level. |
 | **Content field structure** | 🟡 opencode-aligned | Extracts text from `content.type=="text" && content.text` (nested) or `content`/`text` as plain string (flat). |
-| **Tool call fields** | 🔴 opencode-specific | Expects `toolCallId`, `title`, `name`, `arguments` (and fallback `params`). Other agents may use different field names. |
+| **Tool call fields** | 🔴 opencode-specific | Expects `toolCallId`, `title`, `name`, `arguments` (and fallback `params`, `input`, `args`). Parameters may be nested inside `rawInput` or spread across top-level fields. Other agents may use different field names. |
 
 ### Content & Prompt
 
@@ -264,7 +349,7 @@ Rosetta is built on top of the **Agent Client Protocol (ACP)**, which is defined
 ## Important Notes
 
 - **Runtime parameters** (`temperature`, `top_p`, etc.) are ignored per ACP spec — they are not forwarded to the agent.
-- **Rosetta Harness Prompt**: When the client provides tools (`req.tools`), Rosetta injects a short `[Rosetta Harness]` system prefix into the ACP prompt telling the agent which tools are client-executed. The agent emits `tool_call` for client tools; Rosetta forwards them as `FunctionCall`/`tool_calls`. When no tools are provided, no harness is injected and all tool calls are agent-internal (backward compatible). See `translate.rs::format_rosetta_harness_prompt()`.
+- **Harness prompt**: When the client provides tools (`req.tools`), Rosetta injects a short Harness Prompt into the ACP agent's context. It tells the agent which tools are client-executed (by name and description), how to call them via `tool_call`, and instructs a fallback strategy: try the client tool first, retry with the agent's own equivalent tool (same name or purpose) on failure, and inform the user if both fail. The prompt can be customized via `ROSETTA_HARNESS_PROMPT` (or `--harness-prompt`) and disabled entirely via `ROSETTA_HARNESS_DISABLED=1` (or `--harness-disabled`).
 - **Streaming**: for `stream: true` requests, both APIs now deliver content live, as the ACP agent produces it, instead of collecting the whole turn first:
   - Responses API and Chat Completions both consume `AcpClient::send_prompt_streaming()` through a task-owned bounded channel (`rosetta-server/src/streaming_task.rs`), translating each `session/update` into an SSE event/chunk as it arrives
   - Non-streaming (`stream: false`) requests are unaffected and still use `response_to_streaming_events()`/`response_to_chat_chunks()`'s batch-mode siblings, `response_to_chat_completion()`

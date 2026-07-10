@@ -11,6 +11,7 @@ use rosetta_types::openai::*;
 use rosetta_types::acp::ContentBlock;
 use rosetta_acp::client::AcpClient;
 use rosetta_core::translate::*;
+use crate::session_cache::SessionCache;
 use crate::streaming;
 use crate::streaming_task::{spawn_streaming_prompt, StreamOutcome, STREAM_CHANNEL_CAPACITY};
 
@@ -19,6 +20,9 @@ pub struct AppState {
     pub acp_args: Vec<String>,
     pub cwd: String,
     pub mcp_servers: Vec<serde_json::Value>,
+    pub session_cache: Arc<SessionCache>,
+    pub harness_prompt: Option<String>,
+    pub harness_disabled: bool,
 }
 
 /// Parse the `model` field from the OpenAI request into (model, agent).
@@ -110,38 +114,81 @@ async fn create_response(
     let model = req.model.clone();
     let response_id = generate_response_id();
     let is_streaming = req.stream;
+    let is_continuation = req.previous_response_id.is_some();
 
-    let (_model_only, agent) = parse_model_agent(&model);
-    let mut client = create_acp_client(&state, &model).await?;
+    let consumer_tool_names: Vec<String> = req.tools.iter().map(|t| t.name.clone()).collect();
+    let consumer_tool_info: Vec<ConsumerToolInfo> = req.tools.iter().map(|t| ConsumerToolInfo {
+        name: t.name.clone(),
+        description: t.description.clone(),
+    }).collect();
+    let harness_disabled = state.harness_disabled;
 
-    let mcp = Some(if state.mcp_servers.is_empty() { Vec::new() } else { state.mcp_servers.clone() });
-    let session_resp = client.new_session(&state.cwd, mcp).await.map_err(|e| {
-        error!("Failed to create ACP session: {}", e);
-        axum::http::StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    let session_id = session_resp.session_id;
+    // 2.3: reuse the cached session for a continuation request, or spawn a fresh one.
+    let (mut client, session_id) = if let Some(ref prev_id) = req.previous_response_id {
+        match state.session_cache.take(prev_id).await {
+            Some((cached_client, cached_session_id)) => {
+                info!(prev_id, "Reusing cached session");
+                (cached_client, cached_session_id)
+            }
+            None => return Err(axum::http::StatusCode::NOT_FOUND),
+        }
+    } else {
+        let (_model_only, agent) = parse_model_agent(&model);
+        let mut new_client = create_acp_client(&state, &model).await?;
 
-    if let Some(agent_name) = agent {
-        if let Err(e) = configure_agent(&mut client, &session_id, &agent_name, &session_resp.config_options).await {
+        let mcp = Some(if state.mcp_servers.is_empty() { Vec::new() } else { state.mcp_servers.clone() });
+        let session_resp = new_client.new_session(&state.cwd, mcp).await.map_err(|e| {
+            error!("Failed to create ACP session: {}", e);
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        let sid = session_resp.session_id;
+
+        if let Some(agent_name) = agent
+            && let Err(e) = configure_agent(&mut new_client, &sid, &agent_name, &session_resp.config_options).await
+        {
             error!("Failed to configure agent: {}", e);
         }
-    }
 
-    let mut prompt = openai_input_to_acp_prompt(req.input.as_ref().unwrap_or(&ResponseInput::Text(String::new())));
-    let consumer_tool_names: Vec<String> = req.tools.iter().map(|t| t.name.clone()).collect();
-    if !consumer_tool_names.is_empty() {
-        let harness = format_rosetta_harness_prompt(&consumer_tool_names);
-        let tools_text = format_response_tool_definitions(&req.tools);
-        prompt.insert(0, ContentBlock::Text { text: harness });
-        prompt.insert(0, ContentBlock::Text { text: tools_text });
-    } else if !req.tools.is_empty() {
-        let tools_text = format_response_tool_definitions(&req.tools);
-        prompt.insert(0, ContentBlock::Text { text: tools_text });
-    }
+        (new_client, sid)
+    };
+
+    // 2.4: a continuation prompt carries only the tool results — the agent
+    // already holds the rest of the conversation in its live session.
+    let prompt = if is_continuation {
+        match req.input.as_ref() {
+            Some(ResponseInput::Items(items)) => items
+                .iter()
+                .filter_map(|item| match item {
+                    InputItem::FunctionCallOutput { call_id, output } => Some(ContentBlock::Text {
+                        text: format!("[Tool Result: {}]\n{}", call_id, output),
+                    }),
+                    _ => None,
+                })
+                .collect(),
+            _ => vec![],
+        }
+    } else {
+        let mut prompt = openai_input_to_acp_prompt(req.input.as_ref().unwrap_or(&ResponseInput::Text(String::new())));
+        if !consumer_tool_names.is_empty() {
+            let tools_text = format_response_tool_definitions(&req.tools);
+            prompt.insert(0, ContentBlock::Text { text: tools_text });
+            if !harness_disabled {
+                let harness_text = format_rosetta_harness_prompt(&consumer_tool_info, state.harness_prompt.as_deref());
+                prompt.insert(0, ContentBlock::Text { text: harness_text });
+            }
+        }
+        prompt
+    };
 
     if is_streaming {
         let rx = spawn_streaming_prompt(client, session_id, prompt, STREAM_CHANNEL_CAPACITY);
-        let event_stream = build_live_response_events(rx, response_id, model, consumer_tool_names);
+        let event_stream = build_live_response_events(
+            rx,
+            response_id,
+            model,
+            consumer_tool_names,
+            state.session_cache.clone(),
+        );
         return Ok(streaming::response_event_stream_to_sse(event_stream).into_response());
     }
 
@@ -154,13 +201,23 @@ async fn create_response(
         axum::http::StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let mut accumulator = ResponseAccumulator::new(response_id, model, consumer_tool_names);
+    let mut accumulator = ResponseAccumulator::new(response_id.clone(), model, consumer_tool_names);
     for update in &updates {
         accumulator.process_update_events(update);
     }
     let response = accumulator.finalize();
 
-    let _ = client.close_session(&session_id).await;
+    // 2.5: cache the session when the agent is waiting on a tool result;
+    // otherwise the turn is complete and the session can be closed normally.
+    let has_function_calls = response
+        .output
+        .iter()
+        .any(|item| matches!(item, OutputItem::FunctionCall { .. }));
+    if has_function_calls {
+        state.session_cache.insert(response_id, client, session_id).await;
+    } else {
+        let _ = client.close_session(&session_id).await;
+    }
 
     Ok(Json(response).into_response())
 }
@@ -174,9 +231,10 @@ fn build_live_response_events(
     response_id: String,
     model: String,
     consumer_tool_names: Vec<String>,
+    session_cache: Arc<SessionCache>,
 ) -> impl futures::Stream<Item = ResponseEvent> {
     async_stream::stream! {
-        let mut accumulator = ResponseAccumulator::new(response_id, model, consumer_tool_names);
+        let mut accumulator = ResponseAccumulator::new(response_id.clone(), model, consumer_tool_names);
         yield ResponseEvent::ResponseCreated { sequence_number: 0 };
         yield ResponseEvent::ResponseInProgress { sequence_number: 1 };
 
@@ -187,8 +245,17 @@ fn build_live_response_events(
                         yield event;
                     }
                 }
-                StreamOutcome::Done => {
+                StreamOutcome::DoneWithCache { client, session_id } => {
                     let response = accumulator.finalize();
+                    let has_function_calls = response
+                        .output
+                        .iter()
+                        .any(|item| matches!(item, OutputItem::FunctionCall { .. }));
+                    if has_function_calls {
+                        session_cache.insert(response_id, *client, session_id).await;
+                    } else {
+                        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), client.shutdown()).await;
+                    }
                     let seq = response_completed_seq(&accumulator);
                     yield ResponseEvent::ResponseCompleted { sequence_number: seq, response };
                     return;
@@ -236,21 +303,32 @@ async fn create_chat_completion(
 
     let mut prompt = chat_messages_to_acp_prompt(&req.messages);
     let consumer_tool_names: Vec<String> = req.tools.iter().map(|t| t.function.name.clone()).collect();
+    let consumer_tool_info: Vec<ConsumerToolInfo> = req.tools.iter().map(|t| ConsumerToolInfo {
+        name: t.function.name.clone(),
+        description: t.function.description.clone(),
+    }).collect();
     if !consumer_tool_names.is_empty() {
-        let harness = format_rosetta_harness_prompt(&consumer_tool_names);
-        let tools_text = format_chat_tool_definitions(&req.tools);
-        prompt.insert(0, ContentBlock::Text { text: harness });
-        prompt.insert(0, ContentBlock::Text { text: tools_text });
-    } else if !req.tools.is_empty() {
         let tools_text = format_chat_tool_definitions(&req.tools);
         prompt.insert(0, ContentBlock::Text { text: tools_text });
+        if !state.harness_disabled {
+            let harness_text = format_rosetta_harness_prompt(&consumer_tool_info, state.harness_prompt.as_deref());
+            prompt.insert(0, ContentBlock::Text { text: harness_text });
+        }
     }
 
     if is_streaming {
-        let chat_id = format!("chatcmpl-{}", &response_id);
+        let chat_id = format!("chatcmpl-{}", response_id);
         let created = chrono::Utc::now().timestamp();
         let rx = spawn_streaming_prompt(client, session_id, prompt, STREAM_CHANNEL_CAPACITY);
-        let event_stream = build_live_chat_sse_events(rx, chat_id, model, created, consumer_tool_names);
+        let event_stream = build_live_chat_sse_events(
+            rx,
+            chat_id,
+            model,
+            created,
+            consumer_tool_names,
+            state.session_cache.clone(),
+            response_id,
+        );
         return Ok(axum::response::sse::Sse::new(event_stream).into_response());
     }
 
@@ -287,6 +365,8 @@ fn build_live_chat_sse_events(
     model: String,
     created: i64,
     consumer_tool_names: Vec<String>,
+    session_cache: Arc<SessionCache>,
+    response_id: String,
 ) -> impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>> {
     async_stream::stream! {
         let mut accumulator = ChatChunkAccumulator::new(chat_id.clone(), model.clone(), created, consumer_tool_names);
@@ -299,7 +379,12 @@ fn build_live_chat_sse_events(
                         yield Ok(axum::response::sse::Event::default().data(data));
                     }
                 }
-                StreamOutcome::Done => {
+                StreamOutcome::DoneWithCache { client, session_id } => {
+                    if accumulator.had_client_tool_call {
+                        session_cache.insert(response_id, *client, session_id).await;
+                    } else {
+                        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), client.shutdown()).await;
+                    }
                     let finish_reason = if accumulator.had_client_tool_call { "tool_calls" } else { "stop" };
                     let chunk = chat_final_chunk(&chat_id, &model, created, finish_reason);
                     let data = serde_json::to_string(&chunk).unwrap_or_default();

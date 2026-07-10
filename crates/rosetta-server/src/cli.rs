@@ -78,6 +78,31 @@ pub struct Cli {
         value_name = "HOST:PORT",
     )]
     pub listen: SocketAddr,
+
+    /// Custom template for the Rosetta harness prompt.
+    ///
+    /// When client tools are present, this template replaces the default
+    /// harness prompt. Use `{tools}` as a placeholder for the tool list
+    /// (`- name: description` lines). Falls back to $ROSETTA_HARNESS_PROMPT,
+    /// then to the built-in default template.
+    #[arg(
+        long = "harness-prompt",
+        env = "ROSETTA_HARNESS_PROMPT",
+        value_name = "TEMPLATE",
+    )]
+    pub harness_prompt: Option<String>,
+
+    /// Disable the harness prompt entirely.
+    ///
+    /// When set, no harness prompt is injected even when client tools are
+    /// present. Falls back to $ROSETTA_HARNESS_DISABLED, then to false.
+    #[arg(
+        long = "harness-disabled",
+        env = "ROSETTA_HARNESS_DISABLED",
+        default_value = "false",
+        value_name = "BOOL",
+    )]
+    pub harness_disabled: bool,
 }
 
 /// Newtype wrapper around the parsed MCP servers JSON array.
@@ -98,6 +123,8 @@ pub struct ResolvedConfig {
     pub cwd: String,
     pub mcp_servers: Vec<serde_json::Value>,
     pub listen: SocketAddr,
+    pub harness_prompt: Option<String>,
+    pub harness_disabled: bool,
 }
 
 impl Cli {
@@ -116,6 +143,8 @@ impl Cli {
             cwd,
             mcp_servers: self.mcp_servers.map(|w| w.0).unwrap_or_default(),
             listen: self.listen,
+            harness_prompt: self.harness_prompt,
+            harness_disabled: self.harness_disabled,
         }
     }
 }
@@ -148,6 +177,8 @@ mod tests {
         assert_eq!(cli.cwd, None);
         assert_eq!(cli.mcp_servers, None);
         assert_eq!(cli.listen.to_string(), "0.0.0.0:3000");
+        assert_eq!(cli.harness_prompt, None);
+        assert!(!cli.harness_disabled);
     }
 
     #[test]
@@ -164,12 +195,17 @@ mod tests {
             "/tmp/work",
             "--listen",
             "127.0.0.1:8080",
+            "--harness-prompt",
+            "Custom {tools}",
+            "--harness-disabled",
         ])
         .unwrap();
         assert_eq!(cli.acp_command, "python3");
         assert_eq!(cli.acp_args, vec!["script.py", "extra"]);
         assert_eq!(cli.cwd, Some(PathBuf::from("/tmp/work")));
         assert_eq!(cli.listen.to_string(), "127.0.0.1:8080");
+        assert_eq!(cli.harness_prompt, Some("Custom {tools}".to_string()));
+        assert!(cli.harness_disabled);
     }
 
     #[test]
@@ -250,6 +286,9 @@ mod tests {
             "/tmp/rosetta",
             "--listen",
             "127.0.0.1:4242",
+            "--harness-prompt",
+            "Custom {tools}",
+            "--harness-disabled",
         ])
         .unwrap();
         let cfg = cli.resolve();
@@ -258,6 +297,8 @@ mod tests {
         assert_eq!(cfg.cwd, "/tmp/rosetta");
         assert_eq!(cfg.listen.to_string(), "127.0.0.1:4242");
         assert!(cfg.mcp_servers.is_empty());
+        assert_eq!(cfg.harness_prompt, Some("Custom {tools}".to_string()));
+        assert!(cfg.harness_disabled);
     }
 
     #[test]
