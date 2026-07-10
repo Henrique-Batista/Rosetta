@@ -7,8 +7,45 @@
 
 Rosetta is an HTTP proxy written in Rust that translates between OpenAI's **Responses API** / **Chat Completions API** and the **Agent Client Protocol (ACP)**. It spawns an ACP-compatible agent (e.g. `opencode acp`) via stdio JSON-RPC 2.0 and exposes OpenAI-compatible HTTP endpoints.
 
+## Rosetta as a Bridge
+
+Think of an AI model as a head with no eyes, no hands, no sense of smell — it can only think, listen, and speak. On its own, it can't touch the real world; it depends entirely on someone else to be its body. Picture RoboCop's head: essential, central to the whole, but useless once you take it out of the suit.
+
+An **agent** is the opposite: the closest thing to a fully autonomous being. It has arms, legs, a torso — it can see, hear, touch, move around. The best comparison is an advanced cyborg, or simply a person: a head (the model) wired into a nervous system that gives it a body.
+
+That nervous system — whatever decides *how* and *with what* the model reaches into the world — is exactly what tool calls, MCP servers, and skills are. The head decides *when* to act; the nervous system decides *how* the action actually happens.
+
+### Heads don't just fit into any suit
+
+A person also has a head and a nervous system of their own — but you can't pop that head into RoboCop's armor and walk off. There's no interface for it. The person could *talk* to RoboCop just fine, but *doing* what RoboCop does — piloting that specific body — only a matching head could pull off. The armor was welded shut around one particular head.
+
+That's exactly why swapping the *model* behind an agent is normally so painful: the harness is usually built assuming one specific head.
+
+The talking-and-listening part — the one interface everyone actually agrees on — is precisely the **Responses API / Chat Completions**: a shared language standard for conversing with a model. A person can talk that way too. Different body, different hands, but the same kind of mouth.
+
+### A podcast only cyborgs get invited to
+
+Now picture a podcast where the only thing that matters is talking and listening — except only whoever is wearing RoboCop's cyborg suit gets a seat at the table. A regular person can't just walk in; at best, someone from inside relays a message to them afterward.
+
+That's exactly how today's AI clients work: they expose a **Responses API / Chat Completions** endpoint and assume whatever answers on the other end is "a model." An agent could hold that exact same conversation just fine, in plain natural language — it just never gets invited in, because it doesn't speak the expected dialect at the door.
+
+### Enter Rosetta: the Iron Man suit
+
+Now swap RoboCop's welded-shut armor for **Iron Man's** suit instead. Anyone can climb in — a person, or even another cyborg — as long as they know the controls. Crucially, whoever's inside doesn't stop being *themselves*: their instincts, their tacit know-how (their "skills"), things they already knew how to do — all of it still applies, including things RoboCop's armor never had a socket for.
+
+**Rosetta is that suit** — with a bit of **Jarvis** wired in. It speaks a protocol slightly different from what Iron Man normally speaks on the inside: the **Agent Client Protocol (ACP)**. That's what lets it plug into, and extend, everything the suit can do.
+
+Where Iron Man might "search his own memory" for something (a tool that only exists on the *agent's* side), Jarvis can reach into a database Tony has access to from *outside* the suit (a tool that only exists on the *client's* side). Two different sources of context, one seamless conversation.
+
+That's the whole trick:
+- **Responses API / Chat Completions** guarantees that whoever's wearing the suit can still talk to everyone outside it, in the language they already speak.
+- **ACP** guarantees that anyone — any model, any client — can climb into the suit and know exactly how to fly it.
+
+Put both together, and putting on the suit stops requiring one specific head. Any head fits. That's Rosetta.
+
 ## Table of Contents
 
+- [Rosetta as a Bridge](#rosetta-as-a-bridge) — a playful analogy for what Rosetta does
 - [Installation](#installation)
 - [Configuration](#configuration) — CLI flags and environment variables, with precedence
 - [Model & Agent Selection](#model--agent-selection)

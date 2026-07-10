@@ -7,8 +7,45 @@
 
 Rosetta é um proxy HTTP escrito em Rust que traduz entre a **Responses API** / **Chat Completions API** da OpenAI e o **Agent Client Protocol (ACP)**. Ele inicia um agente compatível com ACP (ex.: `opencode acp`) via stdio JSON-RPC 2.0 e expõe endpoints HTTP compatíveis com a OpenAI.
 
+## Rosetta como Ponte
+
+Pense em um modelo de IA como uma cabeça sem olhos, sem mãos, sem olfato — só consegue pensar, escutar e falar. Sozinha, ela não toca o mundo real; depende inteiramente de outra coisa para ser seu corpo. Pense na cabeça do RoboCop: essencial, central para o todo, mas inútil fora da armadura.
+
+Um **agente** é o oposto: o mais próximo que existe de um ser totalmente autônomo. Tem braços, pernas, tronco — consegue ver, ouvir, tocar, se locomover. A melhor comparação é um ciborgue avançado, ou simplesmente uma pessoa: uma cabeça (o modelo) conectada a um sistema nervoso que lhe dá um corpo.
+
+Esse sistema nervoso — o que decide *como* e *com o quê* o modelo alcança o mundo — é justamente o que são as tool calls, os servidores MCP e as skills. A cabeça decide *quando* agir; o sistema nervoso decide *como* a ação de fato acontece.
+
+### Cabeças não encaixam em qualquer armadura
+
+Uma pessoa também tem uma cabeça e um sistema nervoso próprio — mas não dá para simplesmente encaixar essa cabeça na armadura do RoboCop e sair andando por aí. Não existe interface para isso. A pessoa até conseguiria *conversar* com o RoboCop, mas *fazer* o que o RoboCop faz — pilotar aquele corpo específico — só uma cabeça compatível conseguiria. A armadura foi soldada em torno de uma única cabeça.
+
+É exatamente por isso que trocar o *modelo* por trás de um agente costuma ser tão difícil: o harness geralmente é construído assumindo uma cabeça específica.
+
+A parte de falar e escutar — a única interface que todo mundo realmente concorda em usar — é justamente a **Responses API / Chat Completions**: um padrão de linguagem compartilhado para conversar com um modelo. Uma pessoa também consegue se comunicar assim. Corpo diferente, mãos diferentes, mas o mesmo tipo de boca.
+
+### Um podcast que só convida ciborgues
+
+Agora imagine um podcast onde a única coisa que importa é falar e escutar — só que apenas quem está vestindo a armadura ciborgue do RoboCop ganha uma cadeira à mesa. Uma pessoa comum não consegue simplesmente entrar; no máximo, alguém de dentro repassa uma mensagem a ela depois.
+
+É exatamente assim que os clientes de IA atuais funcionam: eles expõem um endpoint **Responses API / Chat Completions** e presumem que quem responde do outro lado é "um modelo". Um agente conseguiria manter essa mesma conversa perfeitamente, em linguagem natural — ele só nunca é convidado a entrar, porque não fala o dialeto esperado na porta.
+
+### Aí entra o Rosetta: a armadura do Homem de Ferro
+
+Agora troque a armadura soldada do RoboCop pela armadura do **Homem de Ferro**. Qualquer um pode vesti-la — uma pessoa, ou até outro ciborgue — desde que conheça os controles. E o mais importante: quem está dentro não deixa de ser *quem é*. Seus próprios instintos, seu conhecimento tácito (suas "skills"), coisas que já sabia fazer — tudo isso continua valendo, inclusive coisas para as quais a armadura do RoboCop nunca teve um encaixe.
+
+**O Rosetta é essa armadura** — com um tanto de **Jarvis** embutido. Ele fala um protocolo um pouco diferente do que o Homem de Ferro costuma falar por dentro: o **Agent Client Protocol (ACP)**. É isso que permite conectar, e estender, tudo o que a armadura é capaz de fazer.
+
+Onde o Homem de Ferro "pesquisaria" algo na própria memória (uma tool que só existe do lado do *agente*), o Jarvis consegue acessar um banco de dados ao qual o Tony tem acesso vindo de *fora* da armadura (uma tool que só existe do lado do *cliente*). Duas fontes de contexto diferentes, uma única conversa contínua.
+
+Esse é o truque todo:
+- A **Responses API / Chat Completions** garante que quem está vestindo a armadura ainda consegue falar com todo mundo do lado de fora, na língua que já conhecem.
+- O **ACP** garante que qualquer um — qualquer modelo, qualquer cliente — consegue vestir a armadura e saber exatamente como pilotá-la.
+
+Junte as duas coisas, e vestir a armadura deixa de exigir uma cabeça específica. Qualquer cabeça serve. Isso é o Rosetta.
+
 ## Sumário
 
+- [Rosetta como Ponte](#rosetta-como-ponte) — uma analogia lúdica para o que o Rosetta faz
 - [Instalação](#instalação)
 - [Configuração](#configuração) — CLI e variáveis de ambiente, com precedência
 - [Seleção de modelo e agente](#seleção-de-modelo-e-agente)
